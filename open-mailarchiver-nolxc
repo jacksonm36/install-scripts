@@ -1,0 +1,400 @@
+#!/usr/bin/env bash
+#
+# Open Archiver installer (non-LXC) — interactive prompts + auto dependency install
+# Prompts the user whether to use Docker for Meilisearch/Valkey/Tika or install binaries locally.
+# Usage: sudo ./open-archiver-install-no-lxc.sh
+set -euo pipefail
+IFS=$'\n\t'
+
+# ----------------------
+# Simple helpers
+# ----------------------
+info() { echo -e "\e[1;34m[INFO]\e[0m $*"; }
+ok()   { echo -e "\e[1;32m[OK]\e[0m $*"; }
+warn() { echo -e "\e[1;33m[WARN]\e[0m $*"; }
+err()  { echo -e "\e[1;31m[ERR]\e[0m $*" >&2; }
+
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    err "Script must be run as root (or with sudo)."
+    exit 1
+  fi
+}
+
+ask() {
+  local prompt="$1"; local default="${2:-}"
+  if [ -n "$default" ]; then
+    read -rp "$prompt [$default]: " REPLY
+    REPLY="${REPLY:-$default}"
+  else
+    read -rp "$prompt: " REPLY
+  fi
+}
+
+ask_secret() {
+  local prompt="$1"; local gen_type="${2:-randhex32}"
+  read -rsp "$prompt (leave blank to auto-generate): " REPLY
+  echo
+  if [ -z "$REPLY" ]; then
+    case "$gen_type" in
+      randhex32) REPLY="$(openssl rand -hex 32)" ;;
+      base64pw) REPLY="$(openssl rand -base64 18 | tr -dc 'a-zA-Z0-9' | cut -c1-18)" ;;
+      base64short) REPLY="$(openssl rand -base64 12)" ;;
+      *) REPLY="$(openssl rand -hex 32)" ;;
+    esac
+  fi
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { err "Missing required command: $1"; exit 1; }
+}
+
+# ----------------------
+# Arg parsing (optional)
+# ----------------------
+USE_DOCKER_SERVICES=
+for arg in "$@"; do
+  case "$arg" in
+    --docker-services) USE_DOCKER_SERVICES=true ;;
+    --no-docker) USE_DOCKER_SERVICES=false ;;
+    -h|--help)
+      cat <<EOF
+Usage: sudo $0 [--docker-services | --no-docker]
+  --docker-services   Deploy Meilisearch, Valkey (Redis) and Tika with Docker.
+  --no-docker         Force normal (non-docker) installation.
+If neither flag provided you will be prompted interactively.
+EOF
+      exit 0
+      ;;
+    *)
+      ;;
+  esac
+done
+
+# ----------------------
+# Pre-flight and prompts
+# ----------------------
+require_root
+
+info "Interactive Open Archiver installer (auto-dependency install)."
+
+# If user didn't pre-specify via CLI, ask now
+if [ -z "${USE_DOCKER_SERVICES+x}" ]; then
+  read -rp "Would you like to run Meilisearch, Valkey (Redis) and Tika as Docker containers? (Y/n): " yn
+  case "${yn,,}" in
+    n|no) USE_DOCKER_SERVICES=false ;;
+    *) USE_DOCKER_SERVICES=true ;;
+  esac
+else
+  info "Docker services preference provided via CLI: $USE_DOCKER_SERVICES"
+fi
+
+# ----------------------
+# Install helpers
+# ----------------------
+install_apt_packages() {
+  info "Installing apt packages: curl wget jq ca-certificates gnupg openssl tar gzip build-essential"
+  apt-get update -y
+  apt-get install -y curl wget jq ca-certificates gnupg openssl tar gzip \
+    build-essential lsb-release software-properties-common apt-transport-https
+  ok "Apt packages installed"
+}
+
+install_nodejs() {
+  info "Installing Node.js 22 (NodeSource)"
+  curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+  apt-get install -y nodejs
+  ok "Node.js $(node --version) installed"
+}
+
+install_corepack_pnpm() {
+  info "Enabling corepack and installing pnpm..."
+  corepack enable || true
+  corepack prepare pnpm@latest --activate || true
+  ok "pnpm enabled"
+}
+
+install_postgresql() {
+  info "Installing PostgreSQL"
+  apt-get install -y postgresql postgresql-contrib
+  systemctl enable --now postgresql || true
+  ok "PostgreSQL installed and started (if available on this system)"
+}
+
+install_docker() {
+  if command -v docker >/dev/null 2>&1; then
+    ok "Docker already installed"
+    return
+  fi
+  info "Installing Docker (engine + CLI)"
+  curl -fsSL https://get.docker.com | sh
+  systemctl enable --now docker || true
+  ok "Docker installed and started"
+  if ! docker compose version >/dev/null 2>&1; then
+    info "Installing docker compose plugin"
+    apt-get install -y docker-compose-plugin || true
+  fi
+}
+
+install_meilisearch_binary() {
+  info "Installing Meilisearch binary (latest release)"
+  local repo="meilisearch/meilisearch"
+  local api="https://api.github.com/repos/${repo}/releases/latest"
+  local asset
+  asset=$(curl -s "$api" | jq -r '.assets[] | select(.name | test("linux.*amd64|linux.*x86_64|linux.*x86-64|linux-x64")) | .browser_download_url' | head -n1)
+  if [ -z "$asset" ] || [ "$asset" = "null" ]; then
+    warn "Could not auto-detect Meilisearch binary for this arch. Skipping binary install."
+    return 1
+  fi
+  curl -fsSL -L "$asset" -o /tmp/meili.tar.gz
+  tar -xzf /tmp/meili.tar.gz -C /tmp
+  local bin
+  bin=$(find /tmp -type f -name 'meilisearch*' -perm /111 | head -n1 || true)
+  if [ -z "$bin" ]; then
+    warn "Meilisearch binary not found in archive"
+    return 1
+  fi
+  install -m 755 "$bin" /usr/local/bin/meilisearch
+  rm -rf /tmp/meili*
+  ok "Meilisearch installed to /usr/local/bin/meilisearch"
+  return 0
+}
+
+# ----------------------
+# Collect configuration from user
+# ----------------------
+ask "Installation directory" "/opt/openarchiver"
+INSTALL_DIR="${REPLY%/}"
+ask "Data directory (storage root)" "/opt/openarchiver-data"
+DATA_DIR="${REPLY%/}"
+
+ask "Postgres DB name" "openarchiver_db"
+DB_NAME="$REPLY"
+ask "Postgres DB user" "openarchiver"
+DB_USER="$REPLY"
+ask_secret "Postgres DB password (hidden)"; DB_PASS="$REPLY"
+
+if [ "$USE_DOCKER_SERVICES" = true ]; then
+  ask "Meilisearch HTTP host (as seen by app)" "http://meilisearch:7700"
+  MEILI_HOST="$REPLY"
+  ask_secret "Meilisearch master key (hidden, leave blank to auto-generate)" "base64short"; MEILI_MASTER_KEY="$REPLY"
+  ask "Redis host (as seen by app)" "valkey"
+  REDIS_HOST="$REPLY"
+  ask_secret "Redis password (hidden, leave blank for none)" "base64pw"; REDIS_PASSWORD="$REPLY"
+  TIKA_URL="http://tika:9998"
+else
+  ask "Meilisearch host (local binary) (default http://127.0.0.1:7700)" "http://127.0.0.1:7700"
+  MEILI_HOST="$REPLY"
+  ask_secret "Meilisearch master key (hidden, leave blank to auto-generate)" "base64short"; MEILI_MASTER_KEY="$REPLY"
+  ask "Redis host (used in .env)" "localhost"
+  REDIS_HOST="$REPLY"
+  ask_secret "Redis password (hidden, leave blank for none)" "base64pw"; REDIS_PASSWORD="$REPLY"
+  ask "Tika URL (leave blank to skip)" ""
+  TIKA_URL="$REPLY"
+fi
+
+ask_secret "JWT secret (hidden, leave blank to auto-generate)" "randhex32"; JWT_SECRET="$REPLY"
+ask_secret "Master encryption key (ENCRYPTION_KEY) (hidden, leave blank to auto-generate)" "randhex32"; ENCRYPTION_KEY="$REPLY"
+
+ask "Application public URL (APP_URL)" "http://127.0.0.1:3000"
+APP_URL="$REPLY"
+ask "Origin (ORIGIN)" "$APP_URL"
+ORIGIN="$REPLY"
+
+info "Summary (sensitive values hidden):"
+echo "  Install dir:    $INSTALL_DIR"
+echo "  Data dir:       $DATA_DIR"
+echo "  Postgres DB:    $DB_NAME"
+echo "  Postgres user:  $DB_USER"
+echo "  Meilisearch host:$MEILI_HOST"
+echo "  Redis host:     $REDIS_HOST"
+echo "  APP_URL:        $APP_URL"
+echo "  Using Docker services: $USE_DOCKER_SERVICES"
+echo
+
+read -rp "Proceed with installation using the above values? (y/N) " CONF
+if [[ "${CONF,,}" != "y" && "${CONF,,}" != "yes" ]]; then
+  warn "Aborted by user."
+  exit 0
+fi
+
+# ----------------------
+# Install dependencies (auto)
+# ----------------------
+install_apt_packages
+install_nodejs
+install_corepack_pnpm
+install_postgresql
+
+if [ "$USE_DOCKER_SERVICES" = true ]; then
+  install_docker
+  ok "Docker available — will deploy Meili/Valkey/Tika containers shortly."
+else
+  if ! install_meilisearch_binary; then
+    warn "Meilisearch binary not installed; you can run Meili in docker or install manually."
+  fi
+fi
+
+# ----------------------
+# Prepare directories and fetch Open Archiver release
+# ----------------------
+info "Preparing directories..."
+mkdir -p "$INSTALL_DIR"
+mkdir -p "$DATA_DIR"
+chown -R root:root "$INSTALL_DIR" "$DATA_DIR"
+chmod 755 "$INSTALL_DIR" "$DATA_DIR"
+
+info "Downloading Open Archiver latest release..."
+REPO="LogicLabs-OU/OpenArchiver"
+API="https://api.github.com/repos/${REPO}/releases/latest"
+TARBALL_URL=$(curl -s "$API" | jq -r '.tarball_url // empty')
+if [ -n "$TARBALL_URL" ]; then
+  curl -fsSL -L "$TARBALL_URL" -o /tmp/openarchiver.tar.gz
+  tar -xzf /tmp/openarchiver.tar.gz -C /opt
+  DIR=$(find /opt -maxdepth 1 -type d -name "LogicLabs-OU-OpenArchiver-*" | head -n1 || true)
+  if [ -n "$DIR" ]; then
+    rsync -a "$DIR"/ "$INSTALL_DIR"/
+    rm -rf "$DIR" /tmp/openarchiver.tar.gz
+    ok "Open Archiver unpacked to $INSTALL_DIR"
+  else
+    warn "Could not locate extracted Open Archiver directory; please populate $INSTALL_DIR manually."
+  fi
+else
+  warn "Could not determine Open Archiver tarball URL from GitHub API."
+fi
+
+# ----------------------
+# Configure PostgreSQL DB & user
+# ----------------------
+info "Configuring PostgreSQL DB and user..."
+sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL || true
+DO
+\$do\$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${DB_USER}') THEN
+    CREATE ROLE ${DB_USER} WITH LOGIN PASSWORD '${DB_PASS}';
+  END IF;
+END
+\$do\$;
+CREATE DATABASE IF NOT EXISTS ${DB_NAME} OWNER ${DB_USER};
+ALTER ROLE ${DB_USER} SET client_encoding TO 'utf8';
+ALTER ROLE ${DB_USER} SET default_transaction_isolation TO 'read committed';
+ALTER ROLE ${DB_USER} SET timezone TO 'UTC';
+SQL
+ok "Database and user configured (best effort)."
+
+# ----------------------
+# Write .env
+# ----------------------
+info "Writing .env to $INSTALL_DIR/.env (DO NOT COMMIT)"
+cat > "${INSTALL_DIR}/.env" <<EOF
+NODE_ENV=production
+POSTGRES_DB=${DB_NAME}
+POSTGRES_USER=${DB_USER}
+POSTGRES_PASSWORD=${DB_PASS}
+DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@localhost:5432/${DB_NAME}
+MEILI_HOST=${MEILI_HOST}
+MEILI_MASTER_KEY=${MEILI_MASTER_KEY}
+REDIS_HOST=${REDIS_HOST}
+REDIS_PASSWORD=${REDIS_PASSWORD}
+STORAGE_LOCAL_ROOT_PATH=${DATA_DIR}
+STORAGE_TYPE=local
+JWT_SECRET=${JWT_SECRET}
+ENCRYPTION_KEY=${ENCRYPTION_KEY}
+TIKA_URL=${TIKA_URL}
+APP_URL=${APP_URL}
+ORIGIN=${ORIGIN}
+EOF
+chmod 600 "${INSTALL_DIR}/.env"
+ok "Wrote .env (permissions 600)."
+
+# ----------------------
+# Optionally deploy docker services
+# ----------------------
+if [ "$USE_DOCKER_SERVICES" = true ]; then
+  info "Creating docker-compose to run Meilisearch, Valkey (Redis) and Tika"
+  install -d -m 755 /opt/openarchiver-docker
+  cat > /opt/openarchiver-docker/docker-compose.yml <<'YAML'
+version: '3.8'
+services:
+  meilisearch:
+    image: getmeili/meilisearch:v1.15
+    environment:
+      - MEILI_MASTER_KEY=${MEILI_MASTER_KEY}
+    ports:
+      - "7700:7700"
+    volumes:
+      - meili_data:/meili_data
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    command: valkey-server --requirepass ${REDIS_PASSWORD}
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey_data:/data
+
+  tika:
+    image: apache/tika:3.2.2.0-full
+    ports:
+      - "9998:9998"
+
+volumes:
+  meili_data:
+  valkey_data:
+YAML
+
+  cat > /opt/openarchiver-docker/.env <<EOF
+MEILI_MASTER_KEY=${MEILI_MASTER_KEY}
+REDIS_PASSWORD=${REDIS_PASSWORD}
+EOF
+
+  info "Starting docker services (meilisearch, valkey, tika)..."
+  cd /opt/openarchiver-docker
+  docker compose up -d || warn "docker compose up failed; check docker status"
+  ok "Docker services started (if docker compose succeeded)."
+fi
+
+# ----------------------
+# Install app deps & build & migrate
+# ----------------------
+info "Installing Node dependencies and building (pnpm). This may take a while..."
+cd "$INSTALL_DIR" || { err "Install dir $INSTALL_DIR missing"; exit 1; }
+pnpm install --shamefully-hoist --frozen-lockfile || pnpm install --shamefully-hoist
+pnpm run build:oss || warn "Build step returned non-zero (continuing)."
+
+info "Running DB migrations (best-effort)..."
+pnpm db:migrate || warn "db:migrate reported an error; check logs."
+
+# ----------------------
+# Create systemd service for Open Archiver
+# ----------------------
+info "Creating systemd service for Open Archiver..."
+cat > /etc/systemd/system/openarchiver.service <<EOF
+[Unit]
+Description=Open Archiver Service
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=${INSTALL_DIR}/.env
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=/usr/bin/corepack exec pnpm -- docker-start:oss
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now openarchiver || warn "Failed to enable/start openarchiver service immediately."
+
+ok "Installation attempted. If services are failing, inspect 'journalctl -u openarchiver -b' and related logs."
+
+echo
+ok "Credentials and config are in ${INSTALL_DIR}/.env (permissions 600)."
+ok "If you used docker services, check 'docker ps' and 'docker compose -f /opt/openarchiver-docker/docker-compose.yml ps'."
+
+# End
