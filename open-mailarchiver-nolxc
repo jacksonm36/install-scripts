@@ -197,8 +197,9 @@ ask_secret "JWT secret (hidden, leave blank to auto-generate)" "randhex32"; JWT_
 ask_secret "Master encryption key (ENCRYPTION_KEY) (hidden, leave blank to auto-generate)" "randhex32"; ENCRYPTION_KEY="$REPLY"
 
 # Detect host IP for APP_URL and ORIGIN defaults
+# Note: hostname -I returns all IP addresses; we use the first one (typically the primary interface)
 HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-HOST_IP="${HOST_IP:-127.0.0.1}"
+HOST_IP="${HOST_IP:-127.0.0.1}"  # Fallback to localhost if detection fails or returns empty
 ask "Application public URL (APP_URL)" "http://${HOST_IP}:3000"
 APP_URL="$REPLY"
 # Auto-fill ORIGIN from APP_URL
