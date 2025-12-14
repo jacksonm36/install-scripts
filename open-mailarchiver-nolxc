@@ -392,9 +392,15 @@ ask_secret "JWT secret (hidden, leave blank to auto-generate)" "randhex32"; JWT_
 ask_secret "Master encryption key (ENCRYPTION_KEY) (hidden, leave blank to auto-generate)" "randhex32"; ENCRYPTION_KEY="$REPLY"
 
 # Auto-fill APP_URL and ORIGIN with host system IP
-# Detect the primary IP address of the host
-HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-# Fallback to 127.0.0.1 if hostname -I fails or returns empty
+# Detect the primary IP address of the host (cross-platform)
+if [[ "$OS_TYPE" == "macos" ]]; then
+  # macOS: use ifconfig to get the primary IP
+  HOST_IP=$(ifconfig | grep 'inet ' | grep -v '127.0.0.1' | head -n1 | awk '{print $2}')
+else
+  # Linux: use hostname -I
+  HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+fi
+# Fallback to 127.0.0.1 if IP detection fails or returns empty
 if [ -z "$HOST_IP" ]; then
   HOST_IP="127.0.0.1"
 fi
@@ -481,6 +487,7 @@ if [[ "$OS_TYPE" == "macos" ]]; then
 fi
 
 sudo -u "$POSTGRES_USER" psql -v ON_ERROR_STOP=1 <<SQL || true
+-- Create user if it doesn't exist
 DO
 \$do\$
 BEGIN
@@ -491,8 +498,14 @@ END
 \$do\$;
 
 -- Create database only if it doesn't exist
-SELECT 'CREATE DATABASE ${DB_NAME} OWNER ${DB_USER}'
-WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${DB_NAME}')\gexec
+DO
+\$do\$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_database WHERE datname = '${DB_NAME}') THEN
+    CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};
+  END IF;
+END
+\$do\$;
 
 ALTER ROLE ${DB_USER} SET client_encoding TO 'utf8';
 ALTER ROLE ${DB_USER} SET default_transaction_isolation TO 'read committed';
