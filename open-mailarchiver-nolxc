@@ -196,10 +196,14 @@ fi
 ask_secret "JWT secret (hidden, leave blank to auto-generate)" "randhex32"; JWT_SECRET="$REPLY"
 ask_secret "Master encryption key (ENCRYPTION_KEY) (hidden, leave blank to auto-generate)" "randhex32"; ENCRYPTION_KEY="$REPLY"
 
-ask "Application public URL (APP_URL)" "http://127.0.0.1:3000"
+# Detect host IP for APP_URL and ORIGIN defaults
+HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+HOST_IP="${HOST_IP:-127.0.0.1}"
+ask "Application public URL (APP_URL)" "http://${HOST_IP}:3000"
 APP_URL="$REPLY"
-ask "Origin (ORIGIN)" "$APP_URL"
-ORIGIN="$REPLY"
+# Auto-fill ORIGIN from APP_URL
+ORIGIN="$APP_URL"
+info "Origin (ORIGIN) auto-set to: $ORIGIN"
 
 info "Summary (sensitive values hidden):"
 echo "  Install dir:    $INSTALL_DIR"
@@ -209,6 +213,7 @@ echo "  Postgres user:  $DB_USER"
 echo "  Meilisearch host:$MEILI_HOST"
 echo "  Redis host:     $REDIS_HOST"
 echo "  APP_URL:        $APP_URL"
+echo "  ORIGIN:         $ORIGIN"
 echo "  Using Docker services: $USE_DOCKER_SERVICES"
 echo
 
