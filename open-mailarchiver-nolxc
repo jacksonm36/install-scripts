@@ -391,8 +391,14 @@ fi
 ask_secret "JWT secret (hidden, leave blank to auto-generate)" "randhex32"; JWT_SECRET="$REPLY"
 ask_secret "Master encryption key (ENCRYPTION_KEY) (hidden, leave blank to auto-generate)" "randhex32"; ENCRYPTION_KEY="$REPLY"
 
-# Auto-fill APP_URL and ORIGIN with default values
-APP_URL="http://127.0.0.1:3000"
+# Auto-fill APP_URL and ORIGIN with host system IP
+# Detect the primary IP address of the host
+HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+# Fallback to 127.0.0.1 if hostname -I fails or returns empty
+if [ -z "$HOST_IP" ]; then
+  HOST_IP="127.0.0.1"
+fi
+APP_URL="http://${HOST_IP}:3000"
 ORIGIN="$APP_URL"
 
 info "Summary (sensitive values hidden):"
