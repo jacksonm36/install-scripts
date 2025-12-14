@@ -50,6 +50,62 @@ require_cmd() {
 }
 
 # ----------------------
+# OS Detection
+# ----------------------
+detect_os() {
+  if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    if [ -f /etc/os-release ]; then
+      . /etc/os-release
+      OS_TYPE="linux"
+      OS_DISTRO="${ID,,}"
+      OS_VERSION="${VERSION_ID:-unknown}"
+    else
+      OS_TYPE="linux"
+      OS_DISTRO="unknown"
+      OS_VERSION="unknown"
+    fi
+  elif [[ "$OSTYPE" == "darwin"* ]]; then
+    OS_TYPE="macos"
+    OS_DISTRO="macos"
+    OS_VERSION=$(sw_vers -productVersion 2>/dev/null || echo "unknown")
+  else
+    OS_TYPE="unknown"
+    OS_DISTRO="unknown"
+    OS_VERSION="unknown"
+  fi
+  
+  # Detect package manager
+  if command -v apt-get >/dev/null 2>&1; then
+    PKG_MANAGER="apt"
+  elif command -v dnf >/dev/null 2>&1; then
+    PKG_MANAGER="dnf"
+  elif command -v yum >/dev/null 2>&1; then
+    PKG_MANAGER="yum"
+  elif command -v brew >/dev/null 2>&1; then
+    PKG_MANAGER="brew"
+  elif command -v pacman >/dev/null 2>&1; then
+    PKG_MANAGER="pacman"
+  else
+    PKG_MANAGER="unknown"
+  fi
+  
+  # Detect service manager
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    SERVICE_MANAGER="systemd"
+  elif command -v service >/dev/null 2>&1; then
+    SERVICE_MANAGER="service"
+  elif command -v launchctl >/dev/null 2>&1; then
+    SERVICE_MANAGER="launchctl"
+  else
+    SERVICE_MANAGER="unknown"
+  fi
+  
+  info "Detected OS: $OS_TYPE / $OS_DISTRO $OS_VERSION"
+  info "Package manager: $PKG_MANAGER"
+  info "Service manager: $SERVICE_MANAGER"
+}
+
+# ----------------------
 # Arg parsing (optional)
 # ----------------------
 USE_DOCKER_SERVICES=
@@ -75,6 +131,7 @@ done
 # Pre-flight and prompts
 # ----------------------
 require_root
+detect_os
 
 info "Interactive Open Archiver installer (auto-dependency install)."
 
@@ -92,18 +149,58 @@ fi
 # ----------------------
 # Install helpers
 # ----------------------
-install_apt_packages() {
-  info "Installing apt packages: curl wget jq ca-certificates gnupg openssl tar gzip build-essential"
-  apt-get update -y
-  apt-get install -y curl wget jq ca-certificates gnupg openssl tar gzip \
-    build-essential lsb-release software-properties-common apt-transport-https
-  ok "Apt packages installed"
+install_base_packages() {
+  info "Installing base packages (OS-specific)"
+  case "$PKG_MANAGER" in
+    apt)
+      apt-get update -y
+      apt-get install -y curl wget jq ca-certificates gnupg openssl tar gzip \
+        build-essential lsb-release software-properties-common apt-transport-https
+      ;;
+    dnf)
+      dnf install -y curl wget jq ca-certificates gnupg2 openssl tar gzip \
+        gcc gcc-c++ make redhat-lsb-core
+      ;;
+    yum)
+      yum install -y curl wget jq ca-certificates gnupg2 openssl tar gzip \
+        gcc gcc-c++ make redhat-lsb-core
+      ;;
+    brew)
+      brew install curl wget jq openssl gnu-tar
+      ;;
+    pacman)
+      pacman -Sy --noconfirm curl wget jq ca-certificates gnupg openssl tar gzip base-devel
+      ;;
+    *)
+      warn "Unknown package manager. Please install base packages manually: curl wget jq ca-certificates gnupg openssl tar gzip build-tools"
+      return 1
+      ;;
+  esac
+  ok "Base packages installed"
 }
 
 install_nodejs() {
-  info "Installing Node.js 22 (NodeSource)"
-  curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-  apt-get install -y nodejs
+  info "Installing Node.js 22"
+  case "$PKG_MANAGER" in
+    apt)
+      curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+      apt-get install -y nodejs
+      ;;
+    dnf|yum)
+      curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+      $PKG_MANAGER install -y nodejs
+      ;;
+    brew)
+      brew install node@22 || brew install node
+      ;;
+    pacman)
+      pacman -S --noconfirm nodejs npm
+      ;;
+    *)
+      warn "Cannot auto-install Node.js for this package manager. Please install Node.js 22 manually."
+      return 1
+      ;;
+  esac
   ok "Node.js $(node --version) installed"
 }
 
@@ -116,8 +213,49 @@ install_corepack_pnpm() {
 
 install_postgresql() {
   info "Installing PostgreSQL"
-  apt-get install -y postgresql postgresql-contrib
-  systemctl enable --now postgresql || true
+  case "$PKG_MANAGER" in
+    apt)
+      apt-get install -y postgresql postgresql-contrib
+      ;;
+    dnf|yum)
+      $PKG_MANAGER install -y postgresql-server postgresql-contrib
+      # Initialize PostgreSQL data directory on RHEL-based systems
+      # Check if PostgreSQL is already initialized by looking for pg_hba.conf
+      PG_DATA_DIR="/var/lib/pgsql/data"
+      if [ ! -f "$PG_DATA_DIR/pg_hba.conf" ]; then
+        postgresql-setup --initdb || postgresql-setup initdb || true
+      fi
+      ;;
+    brew)
+      brew install postgresql@16 || brew install postgresql
+      ;;
+    pacman)
+      pacman -S --noconfirm postgresql
+      # Initialize PostgreSQL data directory on Arch
+      # Check if PostgreSQL is already initialized by looking for pg_hba.conf
+      PG_DATA_DIR="/var/lib/postgres/data"
+      if [ ! -f "$PG_DATA_DIR/pg_hba.conf" ]; then
+        sudo -u postgres initdb -D "$PG_DATA_DIR" || true
+      fi
+      ;;
+    *)
+      warn "Cannot auto-install PostgreSQL for this package manager. Please install PostgreSQL manually."
+      return 1
+      ;;
+  esac
+  
+  # Start PostgreSQL service
+  case "$SERVICE_MANAGER" in
+    systemd)
+      systemctl enable --now postgresql || systemctl enable --now postgresql@16-main || true
+      ;;
+    service)
+      service postgresql start || true
+      ;;
+    launchctl)
+      brew services start postgresql@16 || brew services start postgresql || true
+      ;;
+  esac
   ok "PostgreSQL installed and started (if available on this system)"
 }
 
@@ -127,12 +265,44 @@ install_docker() {
     return
   fi
   info "Installing Docker (engine + CLI)"
-  curl -fsSL https://get.docker.com | sh
-  systemctl enable --now docker || true
+  
+  case "$OS_TYPE" in
+    linux)
+      curl -fsSL https://get.docker.com | sh
+      case "$SERVICE_MANAGER" in
+        systemd)
+          systemctl enable --now docker || true
+          ;;
+        service)
+          service docker start || true
+          ;;
+      esac
+      ;;
+    macos)
+      warn "Docker Desktop for macOS must be installed manually from https://www.docker.com/products/docker-desktop"
+      warn "Please install Docker Desktop and ensure it is running before continuing."
+      read -rp "Press Enter once Docker is installed and running..."
+      ;;
+    *)
+      warn "Unsupported OS for automatic Docker installation. Please install Docker manually."
+      return 1
+      ;;
+  esac
+  
   ok "Docker installed and started"
   if ! docker compose version >/dev/null 2>&1; then
     info "Installing docker compose plugin"
-    apt-get install -y docker-compose-plugin || true
+    case "$PKG_MANAGER" in
+      apt)
+        apt-get install -y docker-compose-plugin || true
+        ;;
+      dnf|yum)
+        $PKG_MANAGER install -y docker-compose-plugin || true
+        ;;
+      *)
+        warn "Docker compose plugin installation may require manual setup on this system"
+        ;;
+    esac
   fi
 }
 
@@ -141,7 +311,32 @@ install_meilisearch_binary() {
   local repo="meilisearch/meilisearch"
   local api="https://api.github.com/repos/${repo}/releases/latest"
   local asset
-  asset=$(curl -s "$api" | jq -r '.assets[] | select(.name | test("linux.*amd64|linux.*x86_64|linux.*x86-64|linux-x64")) | .browser_download_url' | head -n1)
+  local arch_pattern
+  
+  # Detect architecture
+  local machine_arch=$(uname -m)
+  case "$machine_arch" in
+    x86_64|amd64)
+      if [[ "$OS_TYPE" == "macos" ]]; then
+        arch_pattern="macos.*amd64|macos.*x86_64|macos.*x86-64|darwin.*x86"
+      else
+        arch_pattern="linux.*amd64|linux.*x86_64|linux.*x86-64|linux-x64"
+      fi
+      ;;
+    aarch64|arm64)
+      if [[ "$OS_TYPE" == "macos" ]]; then
+        arch_pattern="macos.*aarch64|macos.*arm64|darwin.*arm"
+      else
+        arch_pattern="linux.*aarch64|linux.*arm64"
+      fi
+      ;;
+    *)
+      warn "Unsupported architecture for Meilisearch binary: $machine_arch"
+      return 1
+      ;;
+  esac
+  
+  asset=$(curl -s "$api" | jq -r ".assets[] | select(.name | test(\"$arch_pattern\")) | .browser_download_url" | head -n1)
   if [ -z "$asset" ] || [ "$asset" = "null" ]; then
     warn "Could not auto-detect Meilisearch binary for this arch. Skipping binary install."
     return 1
@@ -196,10 +391,21 @@ fi
 ask_secret "JWT secret (hidden, leave blank to auto-generate)" "randhex32"; JWT_SECRET="$REPLY"
 ask_secret "Master encryption key (ENCRYPTION_KEY) (hidden, leave blank to auto-generate)" "randhex32"; ENCRYPTION_KEY="$REPLY"
 
-ask "Application public URL (APP_URL)" "http://127.0.0.1:3000"
-APP_URL="$REPLY"
-ask "Origin (ORIGIN)" "$APP_URL"
-ORIGIN="$REPLY"
+# Auto-fill APP_URL and ORIGIN with host system IP
+# Detect the primary IP address of the host (cross-platform)
+if [[ "$OS_TYPE" == "macos" ]]; then
+  # macOS: use ifconfig to get the primary IP
+  HOST_IP=$(ifconfig | grep 'inet ' | grep -v '127.0.0.1' | head -n1 | awk '{print $2}')
+else
+  # Linux: use hostname -I
+  HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+fi
+# Fallback to 127.0.0.1 if IP detection fails or returns empty
+if [ -z "$HOST_IP" ]; then
+  HOST_IP="127.0.0.1"
+fi
+APP_URL="http://${HOST_IP}:3000"
+ORIGIN="$APP_URL"
 
 info "Summary (sensitive values hidden):"
 echo "  Install dir:    $INSTALL_DIR"
@@ -221,7 +427,7 @@ fi
 # ----------------------
 # Install dependencies (auto)
 # ----------------------
-install_apt_packages
+install_base_packages
 install_nodejs
 install_corepack_pnpm
 install_postgresql
@@ -267,7 +473,21 @@ fi
 # Configure PostgreSQL DB & user
 # ----------------------
 info "Configuring PostgreSQL DB and user..."
-sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL || true
+
+# Determine postgres user based on OS
+POSTGRES_USER="postgres"
+if [[ "$OS_TYPE" == "macos" ]]; then
+  # On macOS with homebrew, try to find the homebrew user
+  # Check who owns the homebrew directory
+  if [ -d "/usr/local/Homebrew" ]; then
+    POSTGRES_USER=$(stat -f '%Su' /usr/local/Homebrew)
+  elif [ -d "/opt/homebrew" ]; then
+    POSTGRES_USER=$(stat -f '%Su' /opt/homebrew)
+  fi
+fi
+
+sudo -u "$POSTGRES_USER" psql -v ON_ERROR_STOP=1 <<SQL || true
+-- Create user if it doesn't exist
 DO
 \$do\$
 BEGIN
@@ -276,7 +496,17 @@ BEGIN
   END IF;
 END
 \$do\$;
-CREATE DATABASE IF NOT EXISTS ${DB_NAME} OWNER ${DB_USER};
+
+-- Create database only if it doesn't exist
+DO
+\$do\$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_database WHERE datname = '${DB_NAME}') THEN
+    CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};
+  END IF;
+END
+\$do\$;
+
 ALTER ROLE ${DB_USER} SET client_encoding TO 'utf8';
 ALTER ROLE ${DB_USER} SET default_transaction_isolation TO 'read committed';
 ALTER ROLE ${DB_USER} SET timezone TO 'UTC';
@@ -367,10 +597,13 @@ info "Running DB migrations (best-effort)..."
 pnpm db:migrate || warn "db:migrate reported an error; check logs."
 
 # ----------------------
-# Create systemd service for Open Archiver
+# Create service for Open Archiver
 # ----------------------
-info "Creating systemd service for Open Archiver..."
-cat > /etc/systemd/system/openarchiver.service <<EOF
+info "Creating service for Open Archiver..."
+
+case "$SERVICE_MANAGER" in
+  systemd)
+    cat > /etc/systemd/system/openarchiver.service <<EOF
 [Unit]
 Description=Open Archiver Service
 After=network-online.target
@@ -387,11 +620,65 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
+    systemctl daemon-reload
+    systemctl enable --now openarchiver || warn "Failed to enable/start openarchiver service immediately."
+    ok "Systemd service created and started"
+    ;;
+    
+  launchctl)
+    # Create a LaunchDaemon for macOS
+    # Detect corepack location
+    COREPACK_PATH=$(command -v corepack || echo "/usr/local/bin/corepack")
+    cat > /Library/LaunchDaemons/org.openarchiver.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.openarchiver</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${COREPACK_PATH}</string>
+        <string>exec</string>
+        <string>pnpm</string>
+        <string>--</string>
+        <string>docker-start:oss</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${INSTALL_DIR}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/var/log/openarchiver.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/openarchiver-error.log</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+EOF
+    launchctl load /Library/LaunchDaemons/org.openarchiver.plist || warn "Failed to load LaunchDaemon"
+    ok "LaunchDaemon created and loaded"
+    ;;
+    
+  service)
+    # Create init.d script for traditional SysV init
+    warn "Traditional service init script creation not fully implemented. You may need to start the service manually."
+    warn "Run: cd ${INSTALL_DIR} && pnpm docker-start:oss"
+    ;;
+    
+  *)
+    warn "Unknown service manager. Service not configured to start automatically."
+    warn "You will need to manually start Open Archiver: cd ${INSTALL_DIR} && pnpm docker-start:oss"
+    ;;
+esac
 
-systemctl daemon-reload
-systemctl enable --now openarchiver || warn "Failed to enable/start openarchiver service immediately."
-
-ok "Installation attempted. If services are failing, inspect 'journalctl -u openarchiver -b' and related logs."
+ok "Installation attempted. Check service logs for any issues."
 
 echo
 ok "Credentials and config are in ${INSTALL_DIR}/.env (permissions 600)."
