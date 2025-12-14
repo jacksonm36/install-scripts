@@ -189,7 +189,7 @@ else
   ask "Redis host (used in .env)" "localhost"
   REDIS_HOST="$REPLY"
   ask_secret "Redis password (hidden, leave blank for none)" "base64pw"; REDIS_PASSWORD="$REPLY"
-  ask "Tika URL (leave blank to skip)" ""
+  ask "Tika URL (default http://127.0.0.1:9998)" "http://127.0.0.1:9998"
   TIKA_URL="$REPLY"
 fi
 
