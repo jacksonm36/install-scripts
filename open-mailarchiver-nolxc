@@ -220,7 +220,9 @@ install_postgresql() {
     dnf|yum)
       $PKG_MANAGER install -y postgresql-server postgresql-contrib
       # Initialize PostgreSQL data directory on RHEL-based systems
-      if [ ! -d "/var/lib/pgsql/data/base" ]; then
+      # Check if PostgreSQL is already initialized by looking for pg_hba.conf
+      PG_DATA_DIR="/var/lib/pgsql/data"
+      if [ ! -f "$PG_DATA_DIR/pg_hba.conf" ]; then
         postgresql-setup --initdb || postgresql-setup initdb || true
       fi
       ;;
@@ -230,8 +232,10 @@ install_postgresql() {
     pacman)
       pacman -S --noconfirm postgresql
       # Initialize PostgreSQL data directory on Arch
-      if [ ! -d "/var/lib/postgres/data/base" ]; then
-        sudo -u postgres initdb -D /var/lib/postgres/data || true
+      # Check if PostgreSQL is already initialized by looking for pg_hba.conf
+      PG_DATA_DIR="/var/lib/postgres/data"
+      if [ ! -f "$PG_DATA_DIR/pg_hba.conf" ]; then
+        sudo -u postgres initdb -D "$PG_DATA_DIR" || true
       fi
       ;;
     *)
@@ -461,7 +465,13 @@ info "Configuring PostgreSQL DB and user..."
 # Determine postgres user based on OS
 POSTGRES_USER="postgres"
 if [[ "$OS_TYPE" == "macos" ]]; then
-  POSTGRES_USER=$(whoami)  # On macOS with homebrew, postgres runs as current user
+  # On macOS with homebrew, try to find the homebrew user
+  # Check who owns the homebrew directory
+  if [ -d "/usr/local/Homebrew" ]; then
+    POSTGRES_USER=$(stat -f '%Su' /usr/local/Homebrew)
+  elif [ -d "/opt/homebrew" ]; then
+    POSTGRES_USER=$(stat -f '%Su' /opt/homebrew)
+  fi
 fi
 
 sudo -u "$POSTGRES_USER" psql -v ON_ERROR_STOP=1 <<SQL || true
@@ -473,7 +483,11 @@ BEGIN
   END IF;
 END
 \$do\$;
-CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};
+
+-- Create database only if it doesn't exist
+SELECT 'CREATE DATABASE ${DB_NAME} OWNER ${DB_USER}'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${DB_NAME}')\gexec
+
 ALTER ROLE ${DB_USER} SET client_encoding TO 'utf8';
 ALTER ROLE ${DB_USER} SET default_transaction_isolation TO 'read committed';
 ALTER ROLE ${DB_USER} SET timezone TO 'UTC';
@@ -594,6 +608,8 @@ EOF
     
   launchctl)
     # Create a LaunchDaemon for macOS
+    # Detect corepack location
+    COREPACK_PATH=$(command -v corepack || echo "/usr/local/bin/corepack")
     cat > /Library/LaunchDaemons/org.openarchiver.plist <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -603,7 +619,7 @@ EOF
     <string>org.openarchiver</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/corepack</string>
+        <string>${COREPACK_PATH}</string>
         <string>exec</string>
         <string>pnpm</string>
         <string>--</string>
