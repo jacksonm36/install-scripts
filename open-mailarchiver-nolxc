@@ -154,8 +154,14 @@ install_base_packages() {
   case "$PKG_MANAGER" in
     apt)
       apt-get update -y
+      # Install base packages
       apt-get install -y curl wget jq ca-certificates gnupg openssl tar gzip \
-        build-essential lsb-release software-properties-common apt-transport-https
+        build-essential lsb-release
+      # software-properties-common only exists on Ubuntu, not pure Debian
+      # apt-transport-https is deprecated and no longer needed in modern apt
+      if [ "$OS_DISTRO" = "ubuntu" ]; then
+        apt-get install -y software-properties-common || true
+      fi
       ;;
     dnf)
       dnf install -y curl wget jq ca-certificates gnupg2 openssl tar gzip \
