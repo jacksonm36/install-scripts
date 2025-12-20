@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Configuration
+PG_VERSION="16"
+PG_DB_NAME="paperlessdb"
+PG_DB_USER="paperless"
+PG_DB_PASS="$(openssl rand -hex 12)"
+SECRET_KEY="$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 32)"
+
+# Helper functions
+msg_info() { echo "[INFO] $*"; }
+msg_ok() { echo "[OK] $*"; }
+
+# Install dependencies
+msg_info "Installing Dependencies (Patience)"
+apt install -y \
+  curl \
+  ca-certificates \
+  lsb-release \
+  redis \
+  build-essential \
+  imagemagick \
+  fonts-liberation \
+  optipng \
+  libpq-dev \
+  libmagic-dev \
+  libzbar0t64 \
+  poppler-utils \
+  default-libmysqlclient-dev \
+  automake \
+  libtool \
+  pkg-config \
+  libtiff-dev \
+  libpng-dev \
+  libleptonica-dev \
+  unpaper \
+  icc-profiles-free \
+  qpdf \
+  libleptonica6 \
+  libxml2 \
+  pngquant \
+  zlib1g \
+  tesseract-ocr \
+  tesseract-ocr-eng \
+  ghostscript
+
+msg_ok "Installed Dependencies"
+
+# Setup PostgreSQL repository if needed
+if ! apt-cache show "postgresql-${PG_VERSION}" >/dev/null 2>&1; then
+  msg_info "Adding PostgreSQL ${PG_VERSION} repository"
+  install -d /usr/share/postgresql-common/pgdg
+  if [[ ! -f /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg ]]; then
+    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg
+  fi
+  if [[ ! -f /etc/apt/sources.list.d/pgdg.list ]]; then
+    echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+    apt-get update
+  fi
+fi
+
+# Setup PostgreSQL
+msg_info "Setting up PostgreSQL ${PG_VERSION}"
+apt install -y "postgresql-${PG_VERSION}" "postgresql-contrib-${PG_VERSION}" || \
+  apt install -y "postgresql-${PG_VERSION}" || true
+
+systemctl enable postgresql || true
+systemctl start postgresql || systemctl restart postgresql
+
+# Wait for PostgreSQL to be ready
+retries=0
+while ! sudo -u postgres psql -c "SELECT 1" >/dev/null 2>&1 && [[ $retries -lt 10 ]]; do
+  sleep 1
+  ((retries++))
+done
+
+# Create or update database user
+if sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='${PG_DB_USER}'" | grep -q 1; then
+  msg_info "User ${PG_DB_USER} already exists, updating password"
+  sudo -u postgres psql -c "ALTER USER ${PG_DB_USER} WITH PASSWORD '${PG_DB_PASS}';"
+else
+  msg_info "Creating PostgreSQL user ${PG_DB_USER}"
+  sudo -u postgres psql -c "CREATE USER ${PG_DB_USER} WITH PASSWORD '${PG_DB_PASS}';"
+fi
+
+# Create database if it doesn't exist
+if sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='${PG_DB_NAME}'" | grep -q 1; then
+  msg_info "Database ${PG_DB_NAME} already exists, updating owner"
+  sudo -u postgres psql -c "ALTER DATABASE ${PG_DB_NAME} OWNER TO ${PG_DB_USER};"
+else
+  msg_info "Creating PostgreSQL database ${PG_DB_NAME}"
+  sudo -u postgres psql -c "CREATE DATABASE ${PG_DB_NAME} OWNER ${PG_DB_USER};"
+fi
+
+# Grant all privileges on the database to the user
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${PG_DB_NAME} TO ${PG_DB_USER};"
+
+# Test connection with the new credentials
+msg_info "Testing PostgreSQL connection"
+if PGPASSWORD="${PG_DB_PASS}" psql -h localhost -U "${PG_DB_USER}" -d "${PG_DB_NAME}" -c "SELECT 1" >/dev/null 2>&1; then
+  msg_ok "PostgreSQL connection test successful"
+else
+  echo "WARNING: PostgreSQL connection test failed, but continuing..." >&2
+fi
+
+msg_ok "PostgreSQL setup complete"
+
+# Install uv
+msg_info "Installing uv"
+if ! command -v uv >/dev/null 2>&1; then
+  UV_INSTALL_SKIP_PROMPT=1 curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+UV_BIN="$(command -v uv || echo "$HOME/.local/bin/uv")"
+# Ensure UV_BIN is an absolute path
+if [[ "${UV_BIN}" != /* ]]; then
+  UV_BIN="$(readlink -f "${UV_BIN}" 2>/dev/null || command -v uv || echo "$HOME/.local/bin/uv")"
+fi
+msg_ok "uv installed at: ${UV_BIN}"
+
+# Fetch and deploy Paperless-ngx
+msg_info "Fetching Paperless-ngx prebuilt release"
+mkdir -p /opt/paperless /tmp/paperless-extract
+
+# Get latest release tag
+LATEST_TAG=$(curl -s https://api.github.com/repos/paperless-ngx/paperless-ngx/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)
+if [[ -z "$LATEST_TAG" ]]; then
+  LATEST_TAG="v2.20.3"  # fallback
+fi
+
+TAG_VERSION="${LATEST_TAG#v}"  # Remove 'v' prefix if present
+DOWNLOAD_URL="https://github.com/paperless-ngx/paperless-ngx/releases/download/${LATEST_TAG}/paperless-ngx-v${TAG_VERSION}.tar.xz"
+
+curl -fsSL "$DOWNLOAD_URL" -o /tmp/paperless-prebuilt.tar.xz
+tar -xf /tmp/paperless-prebuilt.tar.xz -C /tmp/paperless-extract
+rm -f /tmp/paperless-prebuilt.tar.xz
+
+# Handle archive structure - it might extract to a subdirectory
+EXTRACTED_DIR="/tmp/paperless-extract"
+if [[ -d "/tmp/paperless-extract/paperless-ngx-v${TAG_VERSION}" ]]; then
+  EXTRACTED_DIR="/tmp/paperless-extract/paperless-ngx-v${TAG_VERSION}"
+elif [[ -d "/tmp/paperless-extract/paperless-ngx" ]]; then
+  EXTRACTED_DIR="/tmp/paperless-extract/paperless-ngx"
+elif [[ $(ls -A /tmp/paperless-extract | wc -l) -eq 1 && -d /tmp/paperless-extract/* ]]; then
+  EXTRACTED_DIR="$(ls -d /tmp/paperless-extract/* | head -n1)"
+fi
+
+# Move contents to /opt/paperless
+rm -rf /opt/paperless/*
+cp -r "${EXTRACTED_DIR}"/* /opt/paperless/
+rm -rf /tmp/paperless-extract
+rm -rf /opt/paperless/docker || true
+
+# Verify pyproject.toml exists
+if [[ ! -f /opt/paperless/pyproject.toml ]]; then
+  echo "ERROR: pyproject.toml not found after extraction" >&2
+  exit 1
+fi
+
+msg_ok "Paperless-ngx downloaded and extracted"
+
+# Setup Paperless-ngx
+msg_info "Setup Paperless-ngx"
+cd /opt/paperless
+
+"$UV_BIN" sync --all-extras
+
+curl -fsSL "https://raw.githubusercontent.com/paperless-ngx/paperless-ngx/main/paperless.conf.example" -o /opt/paperless/paperless.conf
+
+mkdir -p /opt/paperless_data/{consume,data,media,trash}
+mkdir -p /opt/paperless/static
+
+{
+  echo ""
+  echo "Paperless-ngx Secret Key: $SECRET_KEY"
+  echo "Paperless-ngx WebUI User: admin"
+  echo "Paperless-ngx WebUI Password: $PG_DB_PASS"
+} >>~/paperless-ngx.creds
+
+sed -i \
+  -e 's|^[# ]*PAPERLESS_REDIS=.*|PAPERLESS_REDIS=redis://localhost:6379|' \
+  -e "s|^[# ]*PAPERLESS_CONSUMPTION_DIR=.*|PAPERLESS_CONSUMPTION_DIR=/opt/paperless_data/consume|" \
+  -e "s|^[# ]*PAPERLESS_DATA_DIR=.*|PAPERLESS_DATA_DIR=/opt/paperless_data/data|" \
+  -e "s|^[# ]*PAPERLESS_MEDIA_ROOT=.*|PAPERLESS_MEDIA_ROOT=/opt/paperless_data/media|" \
+  -e "s|^[# ]*PAPERLESS_EMPTY_TRASH_DIR=.*|PAPERLESS_EMPTY_TRASH_DIR=/opt/paperless_data/trash|" \
+  -e "s|^[# ]*PAPERLESS_STATICDIR=.*|PAPERLESS_STATICDIR=/opt/paperless/static|" \
+  -e 's|^[# ]*PAPERLESS_DBHOST=.*|PAPERLESS_DBHOST=localhost|' \
+  -e 's|^[# ]*PAPERLESS_DBPORT=.*|PAPERLESS_DBPORT=5432|' \
+  -e "s|^[# ]*PAPERLESS_DBNAME=.*|PAPERLESS_DBNAME=$PG_DB_NAME|" \
+  -e "s|^[# ]*PAPERLESS_DBUSER=.*|PAPERLESS_DBUSER=$PG_DB_USER|" \
+  -e "s|^[# ]*PAPERLESS_DBPASS=.*|PAPERLESS_DBPASS=$PG_DB_PASS|" \
+  -e "s|^[# ]*PAPERLESS_SECRET_KEY=.*|PAPERLESS_SECRET_KEY=$SECRET_KEY|" \
+  /opt/paperless/paperless.conf
+
+cd /opt/paperless/src
+set -a
+. /opt/paperless/paperless.conf
+set +a
+
+"$UV_BIN" run -- python manage.py migrate
+
+msg_ok "Setup Paperless-ngx"
+
+# Setting up admin Paperless-ngx User & Password
+msg_info "Setting up admin Paperless-ngx User & Password"
+
+cat <<EOF | "$UV_BIN" run -- python /opt/paperless/src/manage.py shell
+from django.contrib.auth import get_user_model
+UserModel = get_user_model()
+user = UserModel.objects.create_user('admin', password='$PG_DB_PASS')
+user.is_superuser = True
+user.is_staff = True
+user.save()
+EOF
+
+msg_ok "Set up admin Paperless-ngx User & Password"
+
+# Installing Natural Language Toolkit
+msg_info "Installing Natural Language Toolkit (Patience)"
+cd /opt/paperless
+"$UV_BIN" run python -m nltk.downloader -d /usr/share/nltk_data snowball_data
+"$UV_BIN" run python -m nltk.downloader -d /usr/share/nltk_data stopwords
+"$UV_BIN" run python -m nltk.downloader -d /usr/share/nltk_data punkt_tab || \
+  "$UV_BIN" run python -m nltk.downloader -d /usr/share/nltk_data punkt
+
+for policy_file in /etc/ImageMagick-6/policy.xml /etc/ImageMagick-7/policy.xml; do
+  if [[ -f "$policy_file" ]]; then
+    sed -i -e 's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/' "$policy_file"
+  fi
+done
+
+msg_ok "Installed Natural Language Toolkit"
+
+# Creating Services
+msg_info "Creating Services"
+
+cat <<EOF >/etc/systemd/system/paperless-scheduler.service
+[Unit]
+Description=Paperless Celery beat
+Requires=redis.service
+
+[Service]
+WorkingDirectory=/opt/paperless/src
+ExecStart=${UV_BIN} run -- celery --app paperless beat --loglevel INFO
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat <<EOF >/etc/systemd/system/paperless-task-queue.service
+[Unit]
+Description=Paperless Celery Workers
+Requires=redis.service
+After=postgresql.service
+
+[Service]
+WorkingDirectory=/opt/paperless/src
+ExecStart=${UV_BIN} run -- celery --app paperless worker --loglevel INFO
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat <<EOF >/etc/systemd/system/paperless-consumer.service
+[Unit]
+Description=Paperless consumer
+Requires=redis.service
+
+[Service]
+WorkingDirectory=/opt/paperless/src
+ExecStartPre=/bin/sleep 2
+ExecStart=${UV_BIN} run -- python manage.py document_consumer
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat <<EOF >/etc/systemd/system/paperless-webserver.service
+[Unit]
+Description=Paperless webserver
+After=network.target
+Wants=network.target
+Requires=redis.service
+
+[Service]
+WorkingDirectory=/opt/paperless/src
+ExecStart=${UV_BIN} run -- granian --interface asgi --ws "paperless.asgi:application"
+Environment=GRANIAN_HOST=::
+Environment=GRANIAN_PORT=8000
+Environment=GRANIAN_WORKERS=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable -q --now paperless-webserver paperless-scheduler paperless-task-queue paperless-consumer
+
+msg_ok "Created Services"
+
+msg_ok "Installation complete!"
+echo ""
+echo "Paperless-ngx is now installed and running."
+echo "Credentials saved to ~/paperless-ngx.creds"
