@@ -231,7 +231,7 @@ server {
     listen 443 ssl;
     listen [::]:443 ssl;
     http2 on;
-    server_name $DOMAIN localhost 127.0.0.1;
+    server_name $DOMAIN localhost 127.0.0.1${EXTERNAL_DOMAIN:+ $EXTERNAL_DOMAIN};
 
     ssl_certificate ${SSL_DIR}/nextcloud.crt;
     ssl_certificate_key ${SSL_DIR}/nextcloud.key;
