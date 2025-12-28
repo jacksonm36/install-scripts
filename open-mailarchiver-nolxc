@@ -12,6 +12,25 @@ msg_info() { echo -e "\e[34m[INFO]\e[0m $*"; }
 msg_ok()   { echo -e "\e[32m[ OK ]\e[0m $*"; }
 msg_err()  { echo -e "\e[31m[ERR]\e[0m $*"; }
 
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    msg_err "This installer must be run as root."; exit 1
+  fi
+}
+
+gen_alnum() {
+  local len="${1:-18}"
+  local out=""
+  while [[ "${#out}" -lt "$len" ]]; do
+    if command -v openssl >/dev/null 2>&1; then
+      out+="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c "$len" || true)"
+    else
+      out+="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$len" || true)"
+    fi
+  done
+  printf '%s' "${out:0:len}"
+}
+
 detect_os() {
   if [[ -r /etc/os-release ]]; then
     . /etc/os-release
@@ -92,7 +111,7 @@ install_postgres() {
     case "$OS_FAMILY" in
       debian)
         echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" >/etc/apt/sources.list.d/pgdg.list
-        curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor >/etc/apt/trusted.gpg.d/postgresql.gpg
+        curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/trusted.gpg.d/postgresql.gpg
         $PM update -y
         $PM install -y "postgresql-${PG_VERSION}" "postgresql-client-${PG_VERSION}"
         ;;
@@ -102,6 +121,42 @@ install_postgres() {
         $PM -y install "postgresql${PG_VERSION//./}" "postgresql${PG_VERSION//./}-server"
         ;;
     esac
+  fi
+}
+
+start_postgres() {
+  msg_info "Starting PostgreSQL service"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    msg_err "systemctl not found; cannot manage PostgreSQL service automatically"; exit 1
+  fi
+
+  # RHEL/Fedora: initialize the data directory if needed.
+  if [[ "$OS_FAMILY" != "debian" ]]; then
+    if [[ -x "/usr/pgsql-${PG_VERSION}/bin/postgresql-${PG_VERSION}-setup" ]]; then
+      "/usr/pgsql-${PG_VERSION}/bin/postgresql-${PG_VERSION}-setup" initdb || true
+    elif command -v "postgresql-${PG_VERSION}-setup" >/dev/null 2>&1; then
+      "postgresql-${PG_VERSION}-setup" initdb || true
+    elif command -v postgresql-setup >/dev/null 2>&1; then
+      postgresql-setup --initdb || true
+    fi
+  fi
+
+  # Try common unit names across distros.
+  systemctl enable -q --now "postgresql@${PG_VERSION}-main" 2>/dev/null || true
+  systemctl enable -q --now "postgresql-${PG_VERSION}" 2>/dev/null || true
+  systemctl enable -q --now postgresql 2>/dev/null || true
+
+  # Wait until PostgreSQL is accepting connections.
+  if command -v pg_isready >/dev/null 2>&1; then
+    local i
+    for i in {1..30}; do
+      if pg_isready -q; then
+        msg_ok "PostgreSQL is ready"
+        return 0
+      fi
+      sleep 1
+    done
+    msg_err "PostgreSQL did not become ready in time"; exit 1
   fi
 }
 
@@ -216,7 +271,7 @@ EOF
 health_checks() {
   local ok=0
   curl -sf http://127.0.0.1:7700/health >/dev/null && msg_ok "MeiliSearch health: OK" || { msg_err "MeiliSearch health: FAILED (http://127.0.0.1:7700/health)"; ok=1; }
-  curl -sfI http://127.0.0.1:9998 >/dev/null && msg_ok "Tika health: OK" || { msg_err "Tika health: FAILED (http://127.0.0.1:9998)"; ok=1; }
+  curl -sf http://127.0.0.1:9998/version >/dev/null && msg_ok "Tika health: OK" || { msg_err "Tika health: FAILED (http://127.0.0.1:9998/version)"; ok=1; }
   return $ok
 }
 
@@ -226,17 +281,19 @@ if [[ -z "$IP_ADDR" ]]; then msg_err "Could not determine IP address"; exit 1; f
 # Generate secrets per run (before Meili install so we can inject master key)
 POSTGRES_DB="openarchiver_db"
 POSTGRES_USER="openarchiver"
-POSTGRES_PASSWORD="$(openssl rand -base64 18 | tr -dc 'a-zA-Z0-9' | cut -c1-18)"
+POSTGRES_PASSWORD="$(gen_alnum 18)"
 MEILI_MASTER_KEY="$(openssl rand -base64 18)"
 JWT_SECRET="$(openssl rand -hex 32)"
 ENCRYPTION_KEY="$(openssl rand -hex 32)"
 
+require_root
 detect_os
 install_base_packages
 install_valkey
 install_java_for_tika
 install_node
 install_postgres
+start_postgres
 install_meili
 install_tika
 
