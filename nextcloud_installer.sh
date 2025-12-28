@@ -15,19 +15,38 @@ genpw() {
 }
 
 # Configuration
-DOMAIN="${DOMAIN:-$(hostname -I | awk '{print $1}')}"
+DEFAULT_DOMAIN="$(hostname -I 2>/dev/null | awk '{print $1}')"
+DEFAULT_DOMAIN="${DEFAULT_DOMAIN:-$(hostname -f 2>/dev/null || hostname)}"
+DOMAIN="${DOMAIN:-$DEFAULT_DOMAIN}"
+if [[ -z "$DOMAIN" ]]; then
+  error "Could not determine DOMAIN (set DOMAIN env var)."
+  exit 1
+fi
 EXTERNAL_DOMAIN="${EXTERNAL_DOMAIN:-}"
 NEXTCLOUD_VER="32.0.3"
 NEXTCLOUD_DIR="${NEXTCLOUD_DIR:-/var/www/nextcloud}"
 DBNAME="${DBNAME:-nextcloud}"
 DBUSER="${DBUSER:-ncuser}"
-DBPASS="$(genpw 32)"
-DBROOTPASS="$(genpw 28)"
 WEBUSER="${WEBUSER:-www-data}"
 NGINX_SITE="/etc/nginx/sites-available/nextcloud"
 SSL_DIR="/etc/ssl/nextcloud"
 SECUREFLAG="/root/.nc_mariadb_secured"
 NEXTCLOUD_DOWNLOAD_URL="https://github.com/nextcloud-releases/server/releases/download/v32.0.3/nextcloud-32.0.3.zip"
+
+# Persist DB secrets so reruns don't break when MariaDB data remains.
+SECRETS_FILE="${SECRETS_FILE:-/root/.nextcloud-installer-secrets}"
+if [[ -f "$SECRETS_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$SECRETS_FILE"
+else
+  DBPASS="$(genpw 32)"
+  DBROOTPASS="$(genpw 28)"
+  cat >"$SECRETS_FILE" <<EOF
+DBPASS='$DBPASS'
+DBROOTPASS='$DBROOTPASS'
+EOF
+  chmod 600 "$SECRETS_FILE"
+fi
 
 # Colors
 RED='\033[0;31m'
@@ -118,7 +137,7 @@ openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
   -keyout "$SSL_DIR/nextcloud.key" \
   -out "$SSL_DIR/nextcloud.crt" \
   -subj "/C=HU/ST=Hungary/L=Budapest/O=Nextcloud/CN=$DOMAIN" \
-  -addext "subjectAltName=DNS:$DOMAIN,DNS:localhost,DNS:127.0.0.1" 2>/dev/null || true
+  -addext "subjectAltName=DNS:$DOMAIN,DNS:localhost,IP:127.0.0.1" 2>/dev/null || true
 chmod 600 "$SSL_DIR/nextcloud.key"
 chmod 644 "$SSL_DIR/nextcloud.crt"
 
@@ -156,7 +175,6 @@ server {
     add_header X-Permitted-Cross-Domain-Policies "none" always;
     add_header X-Robots-Tag "noindex, nofollow" always;
     add_header X-XSS-Protection "1; mode=block" always;
-    add_header Strict-Transport-Security "max-age=15768000; includeSubDomains; preload;" always;
     fastcgi_hide_header X-Powered-By;
 
     client_max_body_size 10G;
@@ -355,7 +373,7 @@ log ">>> Downloading Nextcloud $NEXTCLOUD_VER ..."
 rm -rf "$NEXTCLOUD_DIR"
 wget -qO /tmp/nextcloud.zip "$NEXTCLOUD_DOWNLOAD_URL"
 unzip -qq /tmp/nextcloud.zip -d /var/www/
-chown -R $WEBUSER:$WEBUSER "$NEXTCLOUD_DIR"
+chown -R "$WEBUSER:$WEBUSER" "$NEXTCLOUD_DIR"
 find "$NEXTCLOUD_DIR" -type d -exec chmod 750 {} +
 find "$NEXTCLOUD_DIR" -type f -exec chmod 640 {} +
 
@@ -390,12 +408,12 @@ nginx -t && systemctl reload nginx
 log ">>> Waiting for Nextcloud to be accessible..."
 sleep 5
 
-OCC="sudo -u www-data php $NEXTCLOUD_DIR/occ"
+occ() { sudo -u "$WEBUSER" php "$NEXTCLOUD_DIR/occ" "$@"; }
 if [ -f "$NEXTCLOUD_DIR/occ" ]; then
   ADMIN_PASS=$(genpw 24)
   
   # Install Nextcloud
-  if $OCC maintenance:install \
+  if occ maintenance:install \
     --database mysql \
     --database-name "$DBNAME" \
     --database-user "$DBUSER" \
@@ -412,64 +430,78 @@ fi
 log ">>> Applying Nextcloud configuration..."
 if [ -f "$NEXTCLOUD_DIR/occ" ]; then
   # Trusted domains (both local and external)
-  $OCC config:system:set trusted_domains 0 --value="localhost" 2>/dev/null || true
-  $OCC config:system:set trusted_domains 1 --value="$DOMAIN" 2>/dev/null || true
-  $OCC config:system:set trusted_domains 2 --value="127.0.0.1" 2>/dev/null || true
+  occ config:system:set trusted_domains 0 --value="localhost" 2>/dev/null || true
+  occ config:system:set trusted_domains 1 --value="$DOMAIN" 2>/dev/null || true
+  occ config:system:set trusted_domains 2 --value="127.0.0.1" 2>/dev/null || true
   if [ -n "$EXTERNAL_DOMAIN" ]; then
-    $OCC config:system:set trusted_domains 3 --value="$EXTERNAL_DOMAIN" 2>/dev/null || true
+    occ config:system:set trusted_domains 3 --value="$EXTERNAL_DOMAIN" 2>/dev/null || true
   fi
   
   # Proxy configuration (supports both direct and reverse proxy access)
-  $OCC config:system:set overwriteprotocol --value="https" 2>/dev/null || true
-  $OCC config:system:set overwrite.cli.url --value="https://${EXTERNAL_DOMAIN:-$DOMAIN}" 2>/dev/null || true
-  $OCC config:system:delete overwritehost 2>/dev/null || true
-  $OCC config:system:set trusted_proxies 0 --value="127.0.0.1" 2>/dev/null || true
-  $OCC config:system:set trusted_proxies 1 --value="::1" 2>/dev/null || true
-  $OCC config:system:set forwarded_for_headers 0 --value="HTTP_X_FORWARDED_FOR" 2>/dev/null || true
-  $OCC config:system:set forwarded_for_headers 1 --value="HTTP_X_REAL_IP" 2>/dev/null || true
+  occ config:system:set overwriteprotocol --value="https" 2>/dev/null || true
+  occ config:system:set overwrite.cli.url --value="https://${EXTERNAL_DOMAIN:-$DOMAIN}" 2>/dev/null || true
+  occ config:system:delete overwritehost 2>/dev/null || true
+  occ config:system:set trusted_proxies 0 --value="127.0.0.1" 2>/dev/null || true
+  occ config:system:set trusted_proxies 1 --value="::1" 2>/dev/null || true
+  occ config:system:set forwarded_for_headers 0 --value="HTTP_X_FORWARDED_FOR" 2>/dev/null || true
+  occ config:system:set forwarded_for_headers 1 --value="HTTP_X_REAL_IP" 2>/dev/null || true
   
   # Maintenance and caching
-  $OCC config:app:set core backgroundjobs_mode --value="cron" 2>/dev/null || true
-  $OCC config:system:set maintenance_window_start --type=integer --value=1 2>/dev/null || true
-  $OCC config:system:set default_phone_region --value="HU" 2>/dev/null || true
-  $OCC config:system:set loglevel --value=2 2>/dev/null || true
+  occ config:app:set core backgroundjobs_mode --value="cron" 2>/dev/null || true
+  occ config:system:set maintenance_window_start --type=integer --value=1 2>/dev/null || true
+  occ config:system:set default_phone_region --value="HU" 2>/dev/null || true
+  occ config:system:set loglevel --value=2 2>/dev/null || true
   
-  # Cache configuration (Redis + APCu)
-  if php -m | grep -qi redis; then
-    $OCC config:system:set memcache.local --value='\OC\Memcache\Redis' 2>/dev/null || true
-    $OCC config:system:set memcache.locking --value='\OC\Memcache\Redis' 2>/dev/null || true
-    $OCC config:system:set redis --value='{"host":"localhost","port":6379,"timeout":1.5}' 2>/dev/null || true
-  else
-    $OCC config:system:set memcache.local --value='\OC\Memcache\APCu' 2>/dev/null || true
+  # Cache configuration (APCu local + Redis distributed/locking)
+  HAS_REDIS=0
+  HAS_APCU=0
+  php -m 2>/dev/null | grep -qi '^redis$' && HAS_REDIS=1 || true
+  php -m 2>/dev/null | grep -qi '^apcu$' && HAS_APCU=1 || true
+
+  if (( HAS_APCU == 1 )); then
+    occ config:system:set memcache.local --value='\OC\Memcache\APCu' 2>/dev/null || true
+  elif (( HAS_REDIS == 1 )); then
+    # Fallback if APCu isn't available.
+    occ config:system:set memcache.local --value='\OC\Memcache\Redis' 2>/dev/null || true
+  fi
+
+  if (( HAS_REDIS == 1 )); then
+    occ config:system:set memcache.distributed --value='\OC\Memcache\Redis' 2>/dev/null || true
+    occ config:system:set memcache.locking --value='\OC\Memcache\Redis' 2>/dev/null || true
+    occ config:system:set redis --value='{"host":"localhost","port":6379,"timeout":1.5}' 2>/dev/null || true
   fi
   
   # Database optimizations
-  $OCC db:add-missing-indices 2>/dev/null || true
-  $OCC db:add-missing-primary-keys 2>/dev/null || true
-  $OCC db:add-missing-columns 2>/dev/null || true
-  $OCC maintenance:repair 2>/dev/null || true
+  occ db:add-missing-indices 2>/dev/null || true
+  occ db:add-missing-primary-keys 2>/dev/null || true
+  occ db:add-missing-columns 2>/dev/null || true
+  occ maintenance:repair 2>/dev/null || true
   
   log "Nextcloud configuration applied!"
 fi
 
 # ==================== CRON CONFIGURATION ====================
 log ">>> Configuring Nextcloud cron..."
-$OCC background:cron 2>/dev/null || true
+if [ -f "$NEXTCLOUD_DIR/occ" ]; then
+  occ background:cron 2>/dev/null || true
 
-# System cron
-if [ ! -f /etc/cron.d/nextcloud ]; then
-    cat > /etc/cron.d/nextcloud << CRON
+  # System cron
+  if [ ! -f /etc/cron.d/nextcloud ]; then
+      cat > /etc/cron.d/nextcloud << CRON
 # Nextcloud cron jobs
-*/5  *  *  *  * www-data /usr/bin/php $NEXTCLOUD_DIR/occ background:cron
-30   3  *  *  * www-data /usr/bin/php $NEXTCLOUD_DIR/occ files:scan --all
-0    4  *  *  * www-data /usr/bin/php $NEXTCLOUD_DIR/occ preview:pre-generate
+*/5  *  *  *  * $WEBUSER /usr/bin/php $NEXTCLOUD_DIR/occ background:cron
+30   3  *  *  * $WEBUSER /usr/bin/php $NEXTCLOUD_DIR/occ files:scan --all
+0    4  *  *  * $WEBUSER /usr/bin/php $NEXTCLOUD_DIR/occ preview:pre-generate
 CRON
-    chmod 0644 /etc/cron.d/nextcloud
-fi
+      chmod 0644 /etc/cron.d/nextcloud
+  fi
 
-# User cron
-(crontab -u www-data -l 2>/dev/null | grep -v "occ background:cron"; \
- echo "*/5 * * * * /usr/bin/php $NEXTCLOUD_DIR/occ background:cron") | crontab -u www-data - 2>/dev/null || true
+  # User cron
+  (crontab -u "$WEBUSER" -l 2>/dev/null | grep -v "occ background:cron"; \
+   echo "*/5 * * * * /usr/bin/php $NEXTCLOUD_DIR/occ background:cron") | crontab -u "$WEBUSER" - 2>/dev/null || true
+else
+  warn "Nextcloud occ not found; skipping cron configuration"
+fi
 
 systemctl enable cron 2>/dev/null || true
 systemctl restart cron 2>/dev/null || true
@@ -573,7 +605,7 @@ echo "   WebRTC ports: 10000-20000 (UDP, LAN only)"
 echo ""
 echo "🔧 TROUBLESHOOTING:"
 echo "   Check logs: sudo tail -f /var/log/nginx/error.log"
-echo "   Test cron: sudo -u www-data php $NEXTCLOUD_DIR/occ background:cron"
+echo "   Test cron: sudo -u $WEBUSER php $NEXTCLOUD_DIR/occ background:cron"
 echo "   Firewall: sudo ufw status"
 echo ""
 echo "💾 Complete setup details saved to: $SETUP_COMPLETE_FILE"
