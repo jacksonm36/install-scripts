@@ -29,15 +29,53 @@ require_root() {
 }
 
 arch() {
-  dpkg --print-architecture
+  local m
+  m="$(uname -m)"
+  case "$m" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    *)
+      echo >&2 "[!] Unsupported CPU architecture: ${m}"
+      exit 1
+      ;;
+  esac
 }
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
-apt_install() {
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
+detect_pkg_mgr() {
+  if need_cmd apt-get; then
+    echo "apt"
+  elif need_cmd dnf; then
+    echo "dnf"
+  elif need_cmd yum; then
+    echo "yum"
+  elif need_cmd pacman; then
+    echo "pacman"
+  else
+    echo >&2 "[!] Unsupported distro: no apt-get/dnf/yum/pacman found."
+    exit 1
+  fi
+}
+
+pkg_update() {
+  case "$(detect_pkg_mgr)" in
+    apt) apt-get update -y ;;
+    dnf) dnf -y makecache ;;
+    yum) yum -y makecache ;;
+    pacman) pacman -Sy --noconfirm ;;
+  esac
+}
+
+pkg_install() {
+  case "$(detect_pkg_mgr)" in
+    apt) DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" ;;
+    dnf) dnf -y install "$@" ;;
+    yum) yum -y install "$@" ;;
+    pacman) pacman -S --noconfirm --needed "$@" ;;
+  esac
 }
 
 download() {
@@ -63,9 +101,13 @@ if ! [[ -d /run/systemd/system ]]; then
   exit 1
 fi
 
-echo "[*] Updating apt cache and installing base packages..."
-apt-get update -y
-apt_install ca-certificates curl gnupg tar wget
+echo "[*] Installing base packages..."
+pkg_update
+case "$(detect_pkg_mgr)" in
+  apt) pkg_install ca-certificates curl gnupg tar wget ;;
+  dnf|yum) pkg_install ca-certificates curl gnupg2 tar wget ;;
+  pacman) pkg_install ca-certificates curl gnupg tar wget ;;
+esac
 
 ### DOCKER (for exporters) ####################################################
 
@@ -92,25 +134,32 @@ tmpdir="$(mktemp -d)"
 cleanup() { rm -rf "$tmpdir"; }
 trap cleanup EXIT
 
-prom_tar="prometheus-${PROM_VERSION}.linux-amd64.tar.gz"
+prom_arch="$(arch)"
+prom_tar="prometheus-${PROM_VERSION}.linux-${prom_arch}.tar.gz"
 prom_url="https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/${prom_tar}"
-prom_sha_url="${prom_url}.sha256"
+prom_sha_url="https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/sha256sums.txt"
 
 download "$prom_url" "${tmpdir}/${prom_tar}"
-download "$prom_sha_url" "${tmpdir}/${prom_tar}.sha256"
+download "$prom_sha_url" "${tmpdir}/sha256sums.txt"
 
-# sha256 file format: "<sha>  <filename>"
-prom_expected_sha="$(cut -d' ' -f1 < "${tmpdir}/${prom_tar}.sha256")"
+# sha256sums.txt format: "<sha>  <filename>"
+prom_expected_sha="$(
+  awk -v f="${prom_tar}" '$2 == f { print $1 }' "${tmpdir}/sha256sums.txt" | head -n1
+)"
+if [[ -z "${prom_expected_sha}" ]]; then
+  echo >&2 "[!] Could not find SHA256 for ${prom_tar} in sha256sums.txt"
+  exit 1
+fi
 verify_sha256 "${tmpdir}/${prom_tar}" "$prom_expected_sha"
 
 tar -xzf "${tmpdir}/${prom_tar}" -C "$tmpdir"
 
-install -m 0755 "${tmpdir}/prometheus-${PROM_VERSION}.linux-amd64/prometheus" /usr/local/bin/prometheus
-install -m 0755 "${tmpdir}/prometheus-${PROM_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+install -m 0755 "${tmpdir}/prometheus-${PROM_VERSION}.linux-${prom_arch}/prometheus" /usr/local/bin/prometheus
+install -m 0755 "${tmpdir}/prometheus-${PROM_VERSION}.linux-${prom_arch}/promtool" /usr/local/bin/promtool
 
 rm -rf "${PROM_CFG}/consoles" "${PROM_CFG}/console_libraries"
-cp -r "${tmpdir}/prometheus-${PROM_VERSION}.linux-amd64/consoles" "${PROM_CFG}/"
-cp -r "${tmpdir}/prometheus-${PROM_VERSION}.linux-amd64/console_libraries" "${PROM_CFG}/"
+cp -r "${tmpdir}/prometheus-${PROM_VERSION}.linux-${prom_arch}/consoles" "${PROM_CFG}/"
+cp -r "${tmpdir}/prometheus-${PROM_VERSION}.linux-${prom_arch}/console_libraries" "${PROM_CFG}/"
 chown -R "$PROM_USER:$PROM_USER" "$PROM_CFG"
 
 echo "[*] Writing Prometheus config..."
@@ -226,27 +275,53 @@ docker run -d \
 ### GRAFANA ###################################################################
 
 echo "[*] Installing Grafana ${GRAFANA_VERSION}..."
-grafana_arch="$(arch)"
-case "$grafana_arch" in
-  amd64|arm64) ;;
-  *)
-    echo >&2 "Unsupported architecture for Grafana install: ${grafana_arch}"
-    exit 1
-    ;;
-esac
+grafana_arch="$(arch)" # amd64|arm64
+pkg_mgr="$(detect_pkg_mgr)"
 
-grafana_deb="grafana_${GRAFANA_VERSION}_${grafana_arch}.deb"
-grafana_url="https://dl.grafana.com/oss/release/${grafana_deb}"
-grafana_sha_url="${grafana_url}.sha256"
+if [[ "$pkg_mgr" == "apt" ]]; then
+  grafana_deb="grafana_${GRAFANA_VERSION}_${grafana_arch}.deb"
+  grafana_url="https://dl.grafana.com/oss/release/${grafana_deb}"
+  grafana_sha_url="${grafana_url}.sha256"
 
-download "$grafana_url" "${tmpdir}/${grafana_deb}"
-download "$grafana_sha_url" "${tmpdir}/${grafana_deb}.sha256"
+  download "$grafana_url" "${tmpdir}/${grafana_deb}"
+  download "$grafana_sha_url" "${tmpdir}/${grafana_deb}.sha256"
 
-grafana_expected_sha="$(cut -d' ' -f1 < "${tmpdir}/${grafana_deb}.sha256")"
-verify_sha256 "${tmpdir}/${grafana_deb}" "$grafana_expected_sha"
+  grafana_expected_sha="$(cut -d' ' -f1 < "${tmpdir}/${grafana_deb}.sha256")"
+  verify_sha256 "${tmpdir}/${grafana_deb}" "$grafana_expected_sha"
 
-apt_install adduser libfontconfig1
-dpkg -i "${tmpdir}/${grafana_deb}" || apt-get -f install -y
+  pkg_install adduser libfontconfig1
+  dpkg -i "${tmpdir}/${grafana_deb}" || apt-get -f install -y
+else
+  case "$grafana_arch" in
+    amd64) grafana_rpm_arch="x86_64" ;;
+    arm64) grafana_rpm_arch="aarch64" ;;
+  esac
+
+  grafana_rpm="grafana-${GRAFANA_VERSION}-1.${grafana_rpm_arch}.rpm"
+  grafana_url="https://dl.grafana.com/oss/release/${grafana_rpm}"
+  grafana_sha_url="${grafana_url}.sha256"
+
+  download "$grafana_url" "${tmpdir}/${grafana_rpm}"
+  download "$grafana_sha_url" "${tmpdir}/${grafana_rpm}.sha256"
+
+  grafana_expected_sha="$(cut -d' ' -f1 < "${tmpdir}/${grafana_rpm}.sha256")"
+  verify_sha256 "${tmpdir}/${grafana_rpm}" "$grafana_expected_sha"
+
+  # fontconfig is required by Grafana; package name differs by distro family.
+  case "$pkg_mgr" in
+    dnf|yum) pkg_install fontconfig ;;
+    pacman) pkg_install fontconfig ;;
+  esac
+
+  case "$pkg_mgr" in
+    dnf) dnf -y install "${tmpdir}/${grafana_rpm}" ;;
+    yum) yum -y install "${tmpdir}/${grafana_rpm}" ;;
+    pacman)
+      echo >&2 "[!] Grafana RPM install not supported on pacman-based distros."
+      exit 1
+      ;;
+  esac
+fi
 
 systemctl daemon-reload
 systemctl enable --now grafana-server
