@@ -12,6 +12,7 @@ GRAFANA_PORT="${GRAFANA_PORT:-3000}"
 BLACKBOX_PORT="${BLACKBOX_PORT:-9115}"
 SPEEDTEST_PORT="${SPEEDTEST_PORT:-9798}"
 
+# Pin images for reproducibility (override if you want newer)
 PROM_IMAGE="${PROM_IMAGE:-prom/prometheus:v2.53.0}"
 GRAFANA_IMAGE="${GRAFANA_IMAGE:-grafana/grafana-oss:12.1.0}"
 BLACKBOX_IMAGE="${BLACKBOX_IMAGE:-prom/blackbox-exporter:v0.26.0}"
@@ -21,8 +22,8 @@ SPEEDTEST_IMAGE="${SPEEDTEST_IMAGE:-miguelndecarvalho/speedtest-exporter:v3.5.4}
 GRAFANA_ADMIN_USER="${GRAFANA_ADMIN_USER:-admin}"
 GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-admin}"
 
-# Grafana.com dashboard ID to auto-provision (internet connection)
-DASHBOARD_ID="${DASHBOARD_ID:-24364}"
+# Space-separated list of URLs to probe via blackbox (override as needed)
+BLACKBOX_TARGETS="${BLACKBOX_TARGETS:-https://www.google.com https://www.cloudflare.com https://www.github.com}"
 
 ### HELPERS ###################################################################
 
@@ -43,7 +44,23 @@ docker_compose() {
   elif need_cmd docker-compose; then
     docker-compose "$@"
   else
-    echo >&2 "[!] docker compose plugin not found."
+    echo >&2 "[!] docker compose is missing. Install the Docker Compose plugin or docker-compose."
+    exit 1
+  fi
+}
+
+ensure_base_tools() {
+  if need_cmd apt-get; then
+    apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl
+  elif need_cmd dnf; then
+    dnf -y install ca-certificates curl
+  elif need_cmd yum; then
+    yum -y install ca-certificates curl
+  elif need_cmd pacman; then
+    pacman -Sy --noconfirm --needed ca-certificates curl
+  else
+    echo >&2 "[!] Unsupported distro: need apt/dnf/yum/pacman"
     exit 1
   fi
 }
@@ -56,42 +73,38 @@ ensure_docker() {
   systemctl enable --now docker >/dev/null 2>&1 || true
 }
 
+yaml_list() {
+  # Print a YAML list of items passed as args with proper indentation (4 spaces).
+  local item
+  for item in "$@"; do
+    printf "        - %s\n" "$item"
+  done
+}
+
 ### MAIN ######################################################################
 
 require_root
 
 if ! [[ -d /run/systemd/system ]]; then
-  echo >&2 "This installer expects systemd (no /run/systemd/system found)."
+  echo >&2 "This installer expects systemd."
   exit 1
 fi
 
-echo "[*] Ensuring base tools..."
-if need_cmd apt-get; then
-  apt-get update -y
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl python3
-elif need_cmd dnf; then
-  dnf -y install ca-certificates curl python3
-elif need_cmd yum; then
-  yum -y install ca-certificates curl python3
-elif need_cmd pacman; then
-  pacman -Sy --noconfirm --needed ca-certificates curl python
-else
-  echo >&2 "[!] Unsupported distro: need apt/dnf/yum/pacman"
-  exit 1
-fi
-
+ensure_base_tools
 ensure_docker
 
-echo "[*] Creating stack directory at ${STACK_DIR}..."
-install -d -m 0755 "${STACK_DIR}"/{prometheus,blackbox,prometheus/data,grafana/data,grafana/provisioning/datasources,grafana/provisioning/dashboards,grafana/dashboards}
-
-# Fix permissions for containers that run as non-root:
-# - prom/prometheus runs as nobody (uid/gid 65534)
-# - grafana runs as uid 472
-chown -R 65534:65534 "${STACK_DIR}/prometheus/data" || true
-chown -R 472:472 "${STACK_DIR}/grafana/data" || true
+echo "[*] Writing stack config under ${STACK_DIR}..."
+install -d -m 0755 \
+  "${STACK_DIR}/prometheus" \
+  "${STACK_DIR}/blackbox" \
+  "${STACK_DIR}/grafana/provisioning/datasources"
 
 echo "[*] Writing Prometheus config..."
+targets=()
+while IFS= read -r t; do
+  [[ -n "$t" ]] && targets+=("$t")
+done < <(printf "%s\n" ${BLACKBOX_TARGETS})
+
 cat > "${STACK_DIR}/prometheus/prometheus.yml" <<EOF
 global:
   scrape_interval: 30s
@@ -115,9 +128,7 @@ scrape_configs:
       module: [http_2xx]
     static_configs:
       - targets:
-          - https://www.google.com
-          - https://www.cloudflare.com
-          - https://www.github.com
+$(yaml_list "${targets[@]}")
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target
@@ -143,10 +154,9 @@ modules:
       preferred_ip_protocol: "ip4"
 EOF
 
-echo "[*] Provisioning Grafana datasource (prometheus)..."
+echo "[*] Provisioning Grafana datasource..."
 cat > "${STACK_DIR}/grafana/provisioning/datasources/prometheus.yml" <<EOF
 apiVersion: 1
-
 datasources:
   - name: prometheus
     uid: prometheus
@@ -157,90 +167,25 @@ datasources:
     editable: true
 EOF
 
-echo "[*] Provisioning Grafana dashboards provider..."
-cat > "${STACK_DIR}/grafana/provisioning/dashboards/provider.yml" <<'EOF'
-apiVersion: 1
-
-providers:
-  - name: 'provisioned'
-    orgId: 1
-    folder: ''
-    type: file
-    disableDeletion: false
-    editable: true
-    options:
-      path: /var/lib/grafana/dashboards
-EOF
-
-echo "[*] Downloading Grafana dashboard ${DASHBOARD_ID} and binding it to datasource uid=prometheus..."
-dashboard_raw="${STACK_DIR}/grafana/dashboards/dashboard-${DASHBOARD_ID}.raw.json"
-dashboard_out="${STACK_DIR}/grafana/dashboards/dashboard-${DASHBOARD_ID}.json"
-curl -fsSL "https://grafana.com/api/dashboards/${DASHBOARD_ID}/revisions/1/download" -o "$dashboard_raw"
-
-# Patch dashboard JSON to not require import-time datasource mapping.
-python3 - <<PY
-import json
-from pathlib import Path
-
-src = Path("${dashboard_raw}")
-dst = Path("${dashboard_out}")
-data = json.loads(src.read_text(encoding="utf-8"))
-
-def walk(x):
-  if isinstance(x, dict):
-    out = {}
-    for k, v in x.items():
-      # Remove import-only inputs so Grafana doesn't expect mapping.
-      if k == "__inputs":
-        continue
-      out[k] = walk(v)
-    return out
-  if isinstance(x, list):
-    return [walk(i) for i in x]
-  # Bind any DS_PROMETHEUS placeholders directly to our provisioned datasource.
-  if x in ("\${DS_PROMETHEUS}", "\${DS_PROMETHEUS}"):
-    return {"type": "prometheus", "uid": "prometheus"}
-  return x
-
-patched = walk(data)
-
-def patch_datasource_fields(x):
-  if isinstance(x, dict):
-    # Older dashboards sometimes store datasource as a string; normalize common cases.
-    if x.get("datasource") in ("Prometheus", "prometheus", "\${DS_PROMETHEUS}"):
-      x["datasource"] = {"type": "prometheus", "uid": "prometheus"}
-    for v in x.values():
-      patch_datasource_fields(v)
-  elif isinstance(x, list):
-    for i in x:
-      patch_datasource_fields(i)
-
-patch_datasource_fields(patched)
-dst.write_text(json.dumps(patched, indent=2), encoding="utf-8")
-PY
-
-rm -f "$dashboard_raw"
-
 echo "[*] Writing docker compose file..."
 cat > "${STACK_DIR}/docker-compose.yml" <<EOF
+name: monitoring-stack
+
 services:
   prometheus:
     image: ${PROM_IMAGE}
-    container_name: prometheus
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
-      - --web.enable-lifecycle
     ports:
       - "${PROM_PORT}:9090"
     volumes:
       - "${STACK_DIR}/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"
-      - "${STACK_DIR}/prometheus/data:/prometheus"
+      - prometheus_data:/prometheus
     restart: unless-stopped
 
   blackbox-exporter:
     image: ${BLACKBOX_IMAGE}
-    container_name: blackbox-exporter
     command:
       - --config.file=/config/blackbox.yml
     ports:
@@ -251,14 +196,12 @@ services:
 
   speedtest-exporter:
     image: ${SPEEDTEST_IMAGE}
-    container_name: speedtest-exporter
     ports:
       - "${SPEEDTEST_PORT}:9798"
     restart: unless-stopped
 
   grafana:
     image: ${GRAFANA_IMAGE}
-    container_name: grafana
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER}
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
@@ -266,14 +209,17 @@ services:
     ports:
       - "${GRAFANA_PORT}:3000"
     volumes:
-      - "${STACK_DIR}/grafana/data:/var/lib/grafana"
+      - grafana_data:/var/lib/grafana
       - "${STACK_DIR}/grafana/provisioning:/etc/grafana/provisioning:ro"
-      - "${STACK_DIR}/grafana/dashboards:/var/lib/grafana/dashboards:ro"
     restart: unless-stopped
+
+volumes:
+  prometheus_data: {}
+  grafana_data: {}
 EOF
 
 echo "[*] Starting stack..."
-docker_compose -f "${STACK_DIR}/docker-compose.yml" up -d --pull always --force-recreate
+docker_compose -f "${STACK_DIR}/docker-compose.yml" up -d --pull always
 
 host_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 host_ip="${host_ip:-<this-host>}"
@@ -285,11 +231,11 @@ echo
 echo " Prometheus:  http://${host_ip}:${PROM_PORT}"
 echo " Grafana:     http://${host_ip}:${GRAFANA_PORT}  (${GRAFANA_ADMIN_USER}/${GRAFANA_ADMIN_PASSWORD})"
 echo
-echo " Grafana should already have:"
+echo " Grafana provisioned:"
 echo " - Datasource: prometheus (default)"
-echo " - Dashboard:  provisioned from grafana.com id ${DASHBOARD_ID}"
 echo
-echo " Config dir:  ${STACK_DIR}"
+echo " Config dir: ${STACK_DIR}"
+echo " Update targets: edit BLACKBOX_TARGETS or ${STACK_DIR}/prometheus/prometheus.yml"
 echo "==============================================================="
 echo
 
