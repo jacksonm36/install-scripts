@@ -326,6 +326,22 @@ fi
 systemctl daemon-reload
 systemctl enable --now grafana-server
 
+echo "[*] Provisioning Grafana Prometheus datasource..."
+install -d -m 0755 /etc/grafana/provisioning/datasources
+cat > /etc/grafana/provisioning/datasources/prometheus.yml <<EOF
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://localhost:${PROM_PORT}
+    isDefault: true
+    editable: true
+EOF
+
+systemctl restart grafana-server
+
 ### SUMMARY ###################################################################
 
 host_ip="$(hostname -I 2>/dev/null | cut -d' ' -f1 || true)"
