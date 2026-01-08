@@ -49,6 +49,25 @@ docker_compose() {
   fi
 }
 
+fix_volume_permissions() {
+  # Docker "local" volumes often come up root:root with 0755, which breaks
+  # non-root containers like Grafana (uid 472) and Prometheus (uid 65534).
+  local project="monitoring-stack"
+  local prom_vol="${project}_prometheus_data"
+  local graf_vol="${project}_grafana_data"
+
+  echo "[*] Ensuring Docker volumes exist..."
+  docker volume create "$prom_vol" >/dev/null
+  docker volume create "$graf_vol" >/dev/null
+
+  echo "[*] Fixing Docker volume permissions (Grafana uid 472, Prometheus uid 65534)..."
+  docker run --rm \
+    -v "${prom_vol}:/prom" \
+    -v "${graf_vol}:/graf" \
+    alpine:3.20 \
+    sh -euc 'chown -R 65534:65534 /prom && chown -R 472:472 /graf' >/dev/null
+}
+
 ensure_base_tools() {
   if need_cmd apt-get; then
     apt-get update -y
@@ -219,7 +238,9 @@ volumes:
 EOF
 
 echo "[*] Starting stack..."
-docker_compose -f "${STACK_DIR}/docker-compose.yml" up -d --pull always
+docker_compose -f "${STACK_DIR}/docker-compose.yml" down --remove-orphans >/dev/null 2>&1 || true
+fix_volume_permissions
+docker_compose -f "${STACK_DIR}/docker-compose.yml" up -d --pull always --force-recreate
 
 host_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 host_ip="${host_ip:-<this-host>}"
