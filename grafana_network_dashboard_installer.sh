@@ -127,21 +127,23 @@ grafana_running_api_ok() {
 
 curl_auth_args() {
   if [[ -n "$GRAFANA_API_TOKEN" ]]; then
-    echo "-H" "Authorization: Bearer ${GRAFANA_API_TOKEN}"
+    printf '%s\n' "-H" "Authorization: Bearer ${GRAFANA_API_TOKEN}"
   else
-    echo "-u" "${GRAFANA_USER}:${GRAFANA_PASS}"
+    printf '%s\n' "-u" "${GRAFANA_USER}:${GRAFANA_PASS}"
   fi
 }
 
 restart_grafana_if_possible() {
-  if command -v systemctl >/dev/null 2>&1; then
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
     if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'grafana-server.service'; then
       log "Restarting grafana-server"
-      systemctl restart grafana-server
+      if ! systemctl restart grafana-server; then
+        warn "systemctl restart grafana-server failed; restart Grafana manually to load provisioning changes."
+      fi
       return 0
     fi
   fi
-  warn "Could not restart Grafana automatically (no systemd unit found). If using provisioning, restart Grafana manually."
+  warn "Could not restart Grafana automatically. If using provisioning, restart Grafana manually."
   return 0
 }
 
@@ -218,6 +220,7 @@ download_and_render_dashboard() {
 
   # Rewrite placeholders so provisioning can load unattended:
   # - Replace every string exactly "${DS_INFLUXDB}" with the chosen datasource name
+  # - Strip __inputs/__requires (Grafana import helpers) to avoid unresolved input variables
   # - Null the "id" field for clean imports
   python3 - "$raw_json" "$tmp_json" "$ds_name" <<'PY'
 import json,sys
@@ -235,6 +238,9 @@ def walk(x):
 data = walk(data)
 if isinstance(data, dict) and "id" in data:
     data["id"] = None
+if isinstance(data, dict):
+    data.pop("__inputs", None)
+    data.pop("__requires", None)
 with open(dst,'w',encoding='utf-8') as f:
     json.dump(data,f,ensure_ascii=False,indent=2)
 PY
@@ -376,11 +382,14 @@ def walk(x):
 data = walk(data)
 if isinstance(data, dict) and "id" in data:
     data["id"] = None
+if isinstance(data, dict):
+    data.pop("__inputs", None)
+    data.pop("__requires", None)
 with open(dst,'w',encoding='utf-8') as f:
     json.dump(data,f,ensure_ascii=False)
 PY
 
-  # Use the import endpoint (supports dashboards exported with inputs/requires)
+  # Use the direct save endpoint; avoids import-time __inputs requirements.
   python3 - "$rendered" "$tmp_payload" <<'PY'
 import json,sys
 dash_path, out_path = sys.argv[1], sys.argv[2]
@@ -401,20 +410,25 @@ PY
   fi
 
   # shellcheck disable=SC2207
-  local auth=($(curl_auth_args))
+  local auth=()
+  mapfile -t auth < <(curl_auth_args)
   http_code="$(
     curl -sS -o /tmp/grafana-import-response.json -w '%{http_code}' \
       "${auth[@]}" \
       -H 'Content-Type: application/json' \
-      -X POST "${GRAFANA_URL%/}/api/dashboards/import" \
+      -X POST "${GRAFANA_URL%/}/api/dashboards/db" \
       --data-binary "@${tmp_payload}" || true
   )"
 
   rm -f "$tmp_json" "$rendered" "$tmp_payload"
 
-  if [[ "$http_code" != "200" && "$http_code" != "202" ]]; then
+  if [[ "$http_code" != "200" ]]; then
     warn "Grafana import response:"
     sed -n '1,200p' /tmp/grafana-import-response.json 2>/dev/null || true
+    if [[ "$http_code" == "401" ]]; then
+      warn "Auth failed. Many distro-packaged Grafana installs do NOT use admin/admin."
+      warn "Use GRAFANA_API_TOKEN (preferred) or set correct GRAFANA_USER/GRAFANA_PASS."
+    fi
     die "Dashboard import failed (HTTP ${http_code})."
   fi
 
@@ -435,7 +449,8 @@ api_upsert_influxdb_datasource() {
   need_cmd python3
 
   # shellcheck disable=SC2207
-  local auth=($(curl_auth_args))
+  local auth=()
+  mapfile -t auth < <(curl_auth_args)
   local tmp_payload http_code
   tmp_payload="$(mktemp)"
 
