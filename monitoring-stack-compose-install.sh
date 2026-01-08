@@ -83,7 +83,13 @@ fi
 ensure_docker
 
 echo "[*] Creating stack directory at ${STACK_DIR}..."
-install -d -m 0755 "${STACK_DIR}"/{prometheus,blackbox,grafana/provisioning/datasources,grafana/provisioning/dashboards,grafana/dashboards}
+install -d -m 0755 "${STACK_DIR}"/{prometheus,blackbox,prometheus/data,grafana/data,grafana/provisioning/datasources,grafana/provisioning/dashboards,grafana/dashboards}
+
+# Fix permissions for containers that run as non-root:
+# - prom/prometheus runs as nobody (uid/gid 65534)
+# - grafana runs as uid 472
+chown -R 65534:65534 "${STACK_DIR}/prometheus/data" || true
+chown -R 472:472 "${STACK_DIR}/grafana/data" || true
 
 echo "[*] Writing Prometheus config..."
 cat > "${STACK_DIR}/prometheus/prometheus.yml" <<EOF
@@ -267,7 +273,7 @@ services:
 EOF
 
 echo "[*] Starting stack..."
-docker_compose -f "${STACK_DIR}/docker-compose.yml" up -d --pull always
+docker_compose -f "${STACK_DIR}/docker-compose.yml" up -d --pull always --force-recreate
 
 host_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 host_ip="${host_ip:-<this-host>}"
