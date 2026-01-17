@@ -14,7 +14,7 @@ services:
       - "TZ=Etc/UTC"
       - "ACME_EMAIL=picikutyu@gmail.com"
       - "NGINX_LOAD_OPENAPPSEC_ATTACHMENT_MODULE=true"
-      - "INITIAL_ADMIN_EMAIL=admin@example.com"
+      - "INITIAL_ADMIN_EMAIL=picikutyu@gmail.com"
       - "INITIAL_ADMIN_PASSWORD=ChangeMeNow!"
       - "NGINX_QUIC_BPF=true"
       - "DISABLE_HTTP=true"
