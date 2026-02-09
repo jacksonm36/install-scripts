@@ -9,20 +9,24 @@ err() { printf '[ERR ] %s\n' "$*"; }
 
 usage() {
   cat <<'EOF'
-Read-only debugger for Pangolin/Traefik config layout.
+Read-only validator for Docker Compose stack + Traefik config.
 
-This script ONLY checks files and reports findings.
-It does not modify any file.
+This script ONLY validates:
+  1) Docker Compose stack files
+  2) Traefik static + dynamic config files
+
+It does not modify anything.
 
 Usage:
-  ./pangolin-config-debugger.sh [--base /root]
+  ./pangolin-config-debugger.sh [options]
 
 Options:
-  --base PATH   Base directory containing:
-                config.tar.gz, docker-compose.yml, docker-compose.yml.backup,
-                GeoLite2-Country_20260116, installer, config/
-                (default: /root)
-  -h, --help    Show help
+  --base PATH          Base path (default: /root)
+  --compose PATH       Compose file (default: <base>/docker-compose.yml)
+  --compose-backup PATH Optional extra compose file
+                       (default: <base>/docker-compose.yml.backup if it exists)
+  --traefik-dir PATH   Traefik config dir (default: <base>/config/traefik)
+  -h, --help           Show help
 
 Exit code:
   0 = no critical findings
@@ -31,10 +35,26 @@ EOF
 }
 
 BASE_DIR="/root"
+COMPOSE_FILE=""
+COMPOSE_BACKUP=""
+TRAEFIK_DIR=""
+
 while (($# > 0)); do
   case "$1" in
     --base)
       BASE_DIR="${2:-}"
+      shift 2
+      ;;
+    --compose)
+      COMPOSE_FILE="${2:-}"
+      shift 2
+      ;;
+    --compose-backup)
+      COMPOSE_BACKUP="${2:-}"
+      shift 2
+      ;;
+    --traefik-dir)
+      TRAEFIK_DIR="${2:-}"
       shift 2
       ;;
     -h|--help)
@@ -49,10 +69,18 @@ while (($# > 0)); do
   esac
 done
 
-if [[ ! -d "$BASE_DIR" ]]; then
-  err "Base directory does not exist: $BASE_DIR"
-  exit 1
+if [[ -z "$COMPOSE_FILE" ]]; then
+  COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 fi
+if [[ -z "$COMPOSE_BACKUP" && -f "$BASE_DIR/docker-compose.yml.backup" ]]; then
+  COMPOSE_BACKUP="$BASE_DIR/docker-compose.yml.backup"
+fi
+if [[ -z "$TRAEFIK_DIR" ]]; then
+  TRAEFIK_DIR="$BASE_DIR/config/traefik"
+fi
+
+STATIC_CFG="$TRAEFIK_DIR/traefik_config.yml"
+DYNAMIC_CFG="$TRAEFIK_DIR/dynamic_config.yml"
 
 critical_count=0
 warning_count=0
@@ -67,131 +95,122 @@ add_warning() {
   warn "$*"
 }
 
-check_path() {
-  local path="$1"
-  local expected="$2"
-  local label="$3"
-
-  if [[ ! -e "$path" ]]; then
-    add_critical "Missing ${label}: $path"
-    return
-  fi
-
-  case "$expected" in
-    file)
-      if [[ -f "$path" ]]; then
-        ok "${label} exists (file): $path"
-      else
-        add_critical "${label} is not a file: $path"
-      fi
-      ;;
-    dir)
-      if [[ -d "$path" ]]; then
-        ok "${label} exists (dir): $path"
-      else
-        add_critical "${label} is not a directory: $path"
-      fi
-      ;;
-    file_or_dir)
-      if [[ -f "$path" || -d "$path" ]]; then
-        ok "${label} exists: $path"
-      else
-        add_critical "${label} exists but has unexpected type: $path"
-      fi
-      ;;
-    *)
-      add_warning "Internal check error: unsupported expected type '$expected' for $path"
-      ;;
-  esac
-}
-
-info "Checking root-level files under: $BASE_DIR"
-check_path "$BASE_DIR/config.tar.gz" "file" "Archive"
-check_path "$BASE_DIR/docker-compose.yml" "file" "Docker Compose file"
-check_path "$BASE_DIR/docker-compose.yml.backup" "file" "Docker Compose backup"
-check_path "$BASE_DIR/GeoLite2-Country_20260116" "dir" "GeoLite extraction directory"
-check_path "$BASE_DIR/installer" "file_or_dir" "Installer"
-check_path "$BASE_DIR/config" "dir" "Config directory"
-
-CONFIG_DIR="$BASE_DIR/config"
-TRAEFIK_DIR="$CONFIG_DIR/traefik"
-
-if [[ -d "$CONFIG_DIR" ]]; then
-  info "Checking expected entries in $CONFIG_DIR"
-  check_path "$CONFIG_DIR/config.yml" "file" "Main config.yml"
-  check_path "$CONFIG_DIR/crowdsec" "dir" "crowdsec directory"
-  check_path "$CONFIG_DIR/crowdsec_logs" "dir" "crowdsec_logs directory"
-  check_path "$CONFIG_DIR/db" "dir" "db directory"
-  check_path "$CONFIG_DIR/GeoLite2-Country.mmdb" "file" "GeoLite2 mmdb"
-  check_path "$CONFIG_DIR/grafana" "dir" "grafana directory"
-  check_path "$CONFIG_DIR/letsencrypt" "dir" "letsencrypt directory"
-  check_path "$CONFIG_DIR/logs" "dir" "logs directory"
-  check_path "$CONFIG_DIR/prometheus" "dir" "prometheus directory"
-  check_path "$CONFIG_DIR/traefik" "dir" "traefik directory"
-fi
-
-if [[ -d "$TRAEFIK_DIR" ]]; then
-  info "Checking Traefik directory structure"
-  check_path "$TRAEFIK_DIR/dynamic_config.yml" "file" "Traefik dynamic config"
-  check_path "$TRAEFIK_DIR/traefik_config.yml" "file" "Traefik static config"
-  check_path "$TRAEFIK_DIR/logs" "dir" "Traefik logs directory"
-fi
-
-if [[ -f "$BASE_DIR/config.tar.gz" ]]; then
-  if tar -tzf "$BASE_DIR/config.tar.gz" >/dev/null 2>&1; then
-    ok "config.tar.gz is readable and not corrupted"
-  else
-    add_critical "config.tar.gz is not readable as a gzip tar archive"
-  fi
-fi
-
-if [[ -f "$CONFIG_DIR/GeoLite2-Country.mmdb" ]]; then
-  mmdb_size="$(wc -c <"$CONFIG_DIR/GeoLite2-Country.mmdb" | tr -d ' ')"
-  if [[ "$mmdb_size" -gt 0 ]]; then
-    ok "GeoLite2-Country.mmdb is present and non-empty (${mmdb_size} bytes)"
-  else
-    add_critical "GeoLite2-Country.mmdb exists but is empty"
-  fi
-fi
-
 validate_compose() {
   local compose_file="$1"
+  local label="$2"
+
+  if [[ -z "$compose_file" ]]; then
+    return
+  fi
   if [[ ! -f "$compose_file" ]]; then
+    add_critical "${label} missing: $compose_file"
     return
   fi
 
-  info "Validating docker-compose syntax: $compose_file"
+  info "Validating ${label}: $compose_file"
 
-  if command -v docker >/dev/null 2>&1; then
-    if docker compose version >/dev/null 2>&1; then
-      if docker compose -f "$compose_file" config -q >/dev/null 2>&1; then
-        ok "docker compose validation passed: $compose_file"
-      else
-        add_critical "docker compose validation failed: $compose_file"
-      fi
-      return
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    if docker compose -f "$compose_file" config -q >/dev/null 2>&1; then
+      ok "${label} is valid"
+    else
+      add_critical "${label} failed docker compose validation"
     fi
+    return
   fi
 
   if command -v docker-compose >/dev/null 2>&1; then
     if docker-compose -f "$compose_file" config -q >/dev/null 2>&1; then
-      ok "docker-compose validation passed: $compose_file"
+      ok "${label} is valid"
     else
-      add_critical "docker-compose validation failed: $compose_file"
+      add_critical "${label} failed docker-compose validation"
     fi
     return
   fi
 
-  add_warning "Docker compose CLI not available; skipped compose validation for: $compose_file"
+  add_critical "Neither 'docker compose' nor 'docker-compose' is available"
 }
 
-validate_compose "$BASE_DIR/docker-compose.yml"
-validate_compose "$BASE_DIR/docker-compose.yml.backup"
+validate_yaml_file() {
+  local file_path="$1"
+  local label="$2"
 
-if [[ -f "$TRAEFIK_DIR/dynamic_config.yml" ]]; then
-  info "Running Traefik dynamic config semantic checks (read-only)"
-  if command -v python3 >/dev/null 2>&1; then
-    py_out="$(python3 - "$TRAEFIK_DIR/dynamic_config.yml" <<'PY'
+  if [[ ! -f "$file_path" ]]; then
+    add_critical "${label} missing: $file_path"
+    return 1
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    add_critical "python3 is required to validate ${label}"
+    return 1
+  fi
+
+  local yaml_out
+  yaml_out="$(python3 - "$file_path" <<'PY'
+import json
+import sys
+path = sys.argv[1]
+try:
+    import yaml  # type: ignore
+except Exception:
+    print(json.dumps({"status": "no_pyyaml"}))
+    raise SystemExit(0)
+
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+except Exception as ex:
+    print(json.dumps({"status": "parse_error", "error": str(ex)}))
+    raise SystemExit(0)
+
+kind = type(data).__name__
+print(json.dumps({"status": "ok", "kind": kind}))
+PY
+)"
+
+  local yaml_status
+  yaml_status="$(python3 - "$yaml_out" <<'PY'
+import json
+import sys
+print(json.loads(sys.argv[1]).get("status", "unknown"))
+PY
+)"
+
+  case "$yaml_status" in
+    ok)
+      ok "${label} YAML syntax is valid"
+      return 0
+      ;;
+    no_pyyaml)
+      add_critical "PyYAML is not installed; cannot validate ${label}"
+      return 1
+      ;;
+    parse_error)
+      local parse_error
+      parse_error="$(python3 - "$yaml_out" <<'PY'
+import json
+import sys
+print(json.loads(sys.argv[1]).get("error", "unknown parse error"))
+PY
+)"
+      add_critical "${label} YAML parse error: ${parse_error}"
+      return 1
+      ;;
+    *)
+      add_critical "${label} unknown YAML validation result: ${yaml_status}"
+      return 1
+      ;;
+  esac
+}
+
+validate_traefik_semantics() {
+  if [[ ! -f "$DYNAMIC_CFG" ]]; then
+    return
+  fi
+
+  info "Validating Traefik dynamic config semantics: $DYNAMIC_CFG"
+
+  local check_out
+  check_out="$(python3 - "$DYNAMIC_CFG" <<'PY'
 import json
 import re
 import sys
@@ -203,15 +222,11 @@ except Exception:
     print(json.dumps({"status": "no_pyyaml"}))
     raise SystemExit(0)
 
-try:
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-except Exception as ex:
-    print(json.dumps({"status": "yaml_parse_error", "error": str(ex)}))
-    raise SystemExit(0)
+with open(path, "r", encoding="utf-8") as f:
+    data = yaml.safe_load(f) or {}
 
 if not isinstance(data, dict):
-    print(json.dumps({"status": "yaml_not_object"}))
+    print(json.dumps({"status": "not_mapping"}))
     raise SystemExit(0)
 
 http = data.get("http")
@@ -227,19 +242,15 @@ if not isinstance(services, dict):
     services = {}
 
 missing_services = []
-hostregexp_missing_tls_domains = []
+missing_tls_domains = []
 host_re = re.compile(r"HostRegexp\(`\{[^}]+\}\.([a-zA-Z0-9.-]+)`\)")
 
 for rname, rdef in routers.items():
     if not isinstance(rdef, dict):
         continue
+
     svc = rdef.get("service")
-    if (
-        isinstance(svc, str)
-        and svc
-        and "@" not in svc
-        and svc not in services
-    ):
+    if isinstance(svc, str) and svc and "@" not in svc and svc not in services:
         missing_services.append({"router": rname, "service": svc})
 
     rule = rdef.get("rule")
@@ -251,8 +262,8 @@ for rname, rdef in routers.items():
             has_domains = isinstance(domains, list) and len(domains) > 0
         if not has_domains:
             m = host_re.search(rule)
-            hostregexp_missing_tls_domains.append(
-                {"router": rname, "domain": m.group(1) if m else "", "rule": rule}
+            missing_tls_domains.append(
+                {"router": rname, "domain": m.group(1) if m else ""}
             )
 
 print(
@@ -262,146 +273,98 @@ print(
             "routers": len(routers),
             "services": len(services),
             "missing_services": missing_services,
-            "hostregexp_missing_tls_domains": hostregexp_missing_tls_domains,
+            "missing_tls_domains": missing_tls_domains,
         }
     )
 )
 PY
 )"
 
-    py_status="$(python3 - "$py_out" <<'PY'
+  local status
+  status="$(python3 - "$check_out" <<'PY'
 import json
 import sys
-data = json.loads(sys.argv[1])
-print(data.get("status", "unknown"))
+print(json.loads(sys.argv[1]).get("status", "unknown"))
 PY
 )"
 
-    case "$py_status" in
-      no_pyyaml)
-        add_warning "python3-yaml (PyYAML) not available; skipped deep YAML semantic checks"
-        ;;
-      yaml_parse_error)
-        parse_err="$(python3 - "$py_out" <<'PY'
+  case "$status" in
+    no_pyyaml)
+      add_critical "PyYAML is not installed; cannot run Traefik semantic checks"
+      ;;
+    not_mapping)
+      add_critical "Traefik dynamic config top-level YAML must be a mapping"
+      ;;
+    missing_http)
+      add_warning "Traefik dynamic config has no top-level 'http' section"
+      ;;
+    ok)
+      local routers_count services_count missing_svc_count missing_tls_count
+      routers_count="$(python3 - "$check_out" <<'PY'
 import json
 import sys
-data = json.loads(sys.argv[1])
-print(data.get("error", "unknown parse error"))
+print(json.loads(sys.argv[1]).get("routers", 0))
 PY
 )"
-        add_critical "dynamic_config.yml YAML parse error: $parse_err"
-        ;;
-      yaml_not_object)
-        add_critical "dynamic_config.yml parsed but top-level object is not a mapping"
-        ;;
-      missing_http)
-        add_warning "dynamic_config.yml has no top-level 'http' section"
-        ;;
-      ok)
-        routers_count="$(python3 - "$py_out" <<'PY'
+      services_count="$(python3 - "$check_out" <<'PY'
 import json
 import sys
-data = json.loads(sys.argv[1])
-print(data.get("routers", 0))
+print(json.loads(sys.argv[1]).get("services", 0))
 PY
 )"
-        services_count="$(python3 - "$py_out" <<'PY'
-import json
-import sys
-data = json.loads(sys.argv[1])
-print(data.get("services", 0))
-PY
-)"
-        ok "dynamic_config.yml parsed: ${routers_count} routers, ${services_count} services"
+      ok "Traefik dynamic config loaded: ${routers_count} routers, ${services_count} services"
 
-        missing_count="$(python3 - "$py_out" <<'PY'
+      missing_svc_count="$(python3 - "$check_out" <<'PY'
 import json
 import sys
-data = json.loads(sys.argv[1])
-print(len(data.get("missing_services", [])))
+print(len(json.loads(sys.argv[1]).get("missing_services", [])))
 PY
 )"
-        if [[ "$missing_count" -gt 0 ]]; then
-          add_critical "Found ${missing_count} router(s) referencing missing service(s)"
-          python3 - "$py_out" <<'PY'
+      if [[ "$missing_svc_count" -gt 0 ]]; then
+        add_critical "Found ${missing_svc_count} router(s) referencing missing service(s)"
+        python3 - "$check_out" <<'PY'
 import json
 import sys
-data = json.loads(sys.argv[1])
-for item in data.get("missing_services", []):
+for item in json.loads(sys.argv[1]).get("missing_services", []):
     print(f"[ERR ] router '{item.get('router')}' -> missing service '{item.get('service')}'")
 PY
-        fi
+      fi
 
-        hostregexp_count="$(python3 - "$py_out" <<'PY'
+      missing_tls_count="$(python3 - "$check_out" <<'PY'
 import json
 import sys
-data = json.loads(sys.argv[1])
-print(len(data.get("hostregexp_missing_tls_domains", [])))
+print(len(json.loads(sys.argv[1]).get("missing_tls_domains", [])))
 PY
 )"
-        if [[ "$hostregexp_count" -gt 0 ]]; then
-          add_warning "Found ${hostregexp_count} HostRegexp router(s) without tls.domains"
-          python3 - "$py_out" <<'PY'
+      if [[ "$missing_tls_count" -gt 0 ]]; then
+        add_warning "Found ${missing_tls_count} HostRegexp router(s) without tls.domains"
+        python3 - "$check_out" <<'PY'
 import json
 import sys
-data = json.loads(sys.argv[1])
-for item in data.get("hostregexp_missing_tls_domains", []):
-    router = item.get("router")
-    domain = item.get("domain") or "unknown"
-    print(f"[WARN] router '{router}' missing tls.domains (derived domain: {domain})")
+for item in json.loads(sys.argv[1]).get("missing_tls_domains", []):
+    print(f"[WARN] router '{item.get('router')}' missing tls.domains (domain: {item.get('domain') or 'unknown'})")
 PY
-        fi
-        ;;
-      *)
-        add_warning "Unknown semantic check result: $py_status"
-        ;;
-    esac
-  else
-    add_warning "python3 not found; skipped Traefik semantic checks"
-  fi
-fi
+      fi
+      ;;
+    *)
+      add_critical "Unknown Traefik semantic validation status: ${status}"
+      ;;
+  esac
+}
 
-if [[ -d "$TRAEFIK_DIR/logs" ]]; then
-  info "Scanning Traefik logs for known warning/error patterns"
-  # Shell glob patterns are intentional and read-only.
-  shopt -s nullglob
-  log_files=("$TRAEFIK_DIR"/logs/*.log "$TRAEFIK_DIR"/logs/*.txt)
-  shopt -u nullglob
-  if [[ "${#log_files[@]}" -eq 0 ]]; then
-    add_warning "No .log/.txt files found in $TRAEFIK_DIR/logs"
-  else
-    if command -v rg >/dev/null 2>&1; then
-      warn_count="$(rg -i --no-heading --line-number "No domain found in rule HostRegexp" "${log_files[@]}" 2>/dev/null | wc -l | tr -d ' ')"
-      miss_count="$(rg -i --no-heading --line-number "service .* does not exist" "${log_files[@]}" 2>/dev/null | wc -l | tr -d ' ')"
-      fetch_count="$(rg -i --no-heading --line-number "cannot fetch configuration data|context deadline exceeded" "${log_files[@]}" 2>/dev/null | wc -l | tr -d ' ')"
-      tls_count="$(rg -i --no-heading --line-number "first record does not look like a TLS handshake" "${log_files[@]}" 2>/dev/null | wc -l | tr -d ' ')"
-    else
-      warn_count="$(grep -Eic "No domain found in rule HostRegexp" "${log_files[@]}" 2>/dev/null || true)"
-      miss_count="$(grep -Eic "service .* does not exist" "${log_files[@]}" 2>/dev/null || true)"
-      fetch_count="$(grep -Eic "cannot fetch configuration data|context deadline exceeded" "${log_files[@]}" 2>/dev/null || true)"
-      tls_count="$(grep -Eic "first record does not look like a TLS handshake" "${log_files[@]}" 2>/dev/null || true)"
-    fi
+info "Starting validation (compose + Traefik only)"
+validate_compose "$COMPOSE_FILE" "Compose file"
+validate_compose "$COMPOSE_BACKUP" "Compose backup file"
 
-    if [[ "$warn_count" -gt 0 ]]; then
-      add_warning "HostRegexp/TLS-domain warning occurrences in logs: $warn_count"
-    fi
-    if [[ "$miss_count" -gt 0 ]]; then
-      add_critical "Missing service error occurrences in logs: $miss_count"
-    fi
-    if [[ "$fetch_count" -gt 0 ]]; then
-      add_critical "Config fetch timeout/error occurrences in logs: $fetch_count"
-    fi
-    if [[ "$tls_count" -gt 0 ]]; then
-      add_warning "TLS handshake mismatch occurrences in logs: $tls_count"
-    fi
-  fi
-fi
+validate_yaml_file "$STATIC_CFG" "Traefik static config"
+validate_yaml_file "$DYNAMIC_CFG" "Traefik dynamic config"
+validate_traefik_semantics
 
 printf '\n'
 info "Summary: ${critical_count} critical, ${warning_count} warning(s)"
 if [[ "$critical_count" -gt 0 ]]; then
-  err "Config debugger found critical issues."
+  err "Validation failed."
   exit 1
 fi
-ok "No critical issues found."
+ok "Validation passed."
 exit 0
