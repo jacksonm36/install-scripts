@@ -92,8 +92,7 @@ trap cleanup EXIT
 info "Fetching ${CONFIG_URL}"
 
 curl_exit=0
-http_code=""
-if ! http_code="$(
+http_code="$(
   curl \
     --silent \
     --show-error \
@@ -102,14 +101,19 @@ if ! http_code="$(
     --output "$tmp_body" \
     --write-out '%{http_code}' \
     "$CONFIG_URL"
-)"; then
-  curl_exit=$?
-fi
+)" || curl_exit=$?
 
 if ((curl_exit != 0)); then
   err "Could not fetch config (curl exit ${curl_exit})."
   err "This matches your 'context deadline exceeded while awaiting headers' symptom."
   err "Check that Pangolin is healthy and reachable from the Traefik container/network."
+  target_host="${BASE_URL#*://}"
+  target_host="${target_host%%/*}"
+  target_host="${target_host%%:*}"
+  if [[ "$target_host" == "pangolin" ]]; then
+    warn "If running this from the Docker host shell, use --url http://127.0.0.1:3001"
+    warn "The hostname 'pangolin' typically resolves only inside Docker networks."
+  fi
   exit 1
 fi
 
