@@ -416,6 +416,31 @@ matrix_proxy_locations() {
 EOF
 }
 
+element_static_locations() {
+  cat <<'EOF'
+    location = /config.json {
+        add_header Cache-Control "no-store";
+        try_files $uri =404;
+    }
+
+    location = /sw.js {
+        add_header Cache-Control "no-cache";
+        try_files $uri =404;
+    }
+
+    location = /service-worker.js {
+        add_header Cache-Control "no-cache";
+        try_files $uri =404;
+    }
+
+    location ~* \.(js|mjs|css|png|jpg|jpeg|gif|svg|ico|webp|woff|woff2|ttf|map)$ {
+        try_files $uri =404;
+        expires 7d;
+        access_log off;
+    }
+EOF
+}
+
 render_nginx_bootstrap_config() {
   cat >"$NGINX_BOOTSTRAP_CONF" <<EOF
 server {
@@ -429,6 +454,8 @@ server {
     location ^~ /.well-known/acme-challenge/ {
         root ${CERTBOT_WEBROOT};
     }
+
+$(element_static_locations)
 
     location / {
         try_files \$uri \$uri/ /index.html;
@@ -486,6 +513,8 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     client_max_body_size 100M;
 
+$(element_static_locations)
+
     location / {
         try_files \$uri \$uri/ /index.html;
     }
@@ -504,6 +533,8 @@ server {
 
     root ${ELEMENT_ROOT};
     index index.html;
+
+$(element_static_locations)
 
     location / {
         try_files \$uri \$uri/ /index.html;
