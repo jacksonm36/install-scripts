@@ -460,9 +460,11 @@ ensure_mariadb_running() {
 
 setup_mariadb_database() {
   ensure_mariadb_running
+  local esc_pass
+  esc_pass="$(sql_escape_literal "$DB_PASS")"
   mysql -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-  mysql -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
-  mysql -e "ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
+  mysql -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${esc_pass}';"
+  mysql -e "ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${esc_pass}';"
   mysql -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost'; FLUSH PRIVILEGES;"
   log "MariaDB database configured."
 }
@@ -821,9 +823,33 @@ configure_coturn() {
   log "Configuring coturn..."
   mkdir -p /var/log/turnserver
 
-  if [[ -z "$TLS_CERT_FILE" || -z "$TLS_KEY_FILE" ]]; then
-    create_self_signed_cert "/etc/turnserver/certs" "turnserver"
+  local turn_cert_dir turn_cert turn_key
+  turn_cert_dir="/etc/turnserver/certs"
+  turn_cert="${turn_cert_dir}/turnserver.crt"
+  turn_key="${turn_cert_dir}/turnserver.key"
+  mkdir -p "$turn_cert_dir"
+
+  if [[ -n "$TLS_CERT_FILE" && -n "$TLS_KEY_FILE" && -f "$TLS_CERT_FILE" && -f "$TLS_KEY_FILE" ]]; then
+    cp -f "$TLS_CERT_FILE" "$turn_cert"
+    cp -f "$TLS_KEY_FILE" "$turn_key"
+  else
+    if ! openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
+      -keyout "$turn_key" \
+      -out "$turn_cert" \
+      -subj "/CN=${TURN_HOST}" \
+      -addext "subjectAltName=DNS:${TURN_HOST},DNS:${SERVER_NAME}" >/dev/null 2>&1; then
+      openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
+        -keyout "$turn_key" \
+        -out "$turn_cert" \
+        -subj "/CN=${TURN_HOST}" >/dev/null 2>&1
+    fi
   fi
+
+  if getent group turnserver >/dev/null 2>&1; then
+    chgrp turnserver "$turn_cert" "$turn_key" || true
+  fi
+  chmod 644 "$turn_cert"
+  chmod 640 "$turn_key"
 
   cat >/etc/turnserver.conf <<EOF
 use-auth-secret
@@ -838,8 +864,8 @@ min-port=49160
 max-port=49200
 no-multicast-peers
 no-cli
-cert=${TLS_CERT_FILE}
-pkey=${TLS_KEY_FILE}
+cert=${turn_cert}
+pkey=${turn_key}
 log-file=/var/log/turnserver/turnserver.log
 simple-log
 EOF
