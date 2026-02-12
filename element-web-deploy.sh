@@ -40,6 +40,11 @@ SUMMARY_FILE="/root/element-web-install-summary.txt"
 WEB_USER="www-data"
 WEB_GROUP="www-data"
 
+# Optional preferred defaults for interactive prompts
+PREFERRED_ELEMENT_FQDN="${ELEMENT_DEFAULT_PUBLIC_FQDN:-chat.gamedns.hu}"
+PREFERRED_MATRIX_SERVER_NAME="${ELEMENT_DEFAULT_MATRIX_SERVER_NAME:-matrix.gamedns.hu}"
+PREFERRED_HOMESERVER_URL="${ELEMENT_DEFAULT_HOMESERVER_URL:-https://${PREFERRED_MATRIX_SERVER_NAME}}"
+
 log() { printf '\033[1;32m[INFO]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
 err() { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; }
@@ -189,16 +194,19 @@ pkg_install() {
 }
 
 collect_inputs() {
-  local default_host
+  local default_host default_element_fqdn default_matrix_name default_homeserver_url
   default_host="$(hostname -f 2>/dev/null || hostname)"
   [[ -n "$default_host" ]] || default_host="chat.example.com"
+  default_element_fqdn="${PREFERRED_ELEMENT_FQDN:-$default_host}"
+  default_matrix_name="${PREFERRED_MATRIX_SERVER_NAME:-$default_element_fqdn}"
+  default_homeserver_url="${PREFERRED_HOMESERVER_URL:-https://${default_matrix_name}}"
 
   printf "\nElement Web deployment v%s\n" "$SCRIPT_VERSION"
   printf "Detected OS: %s\n\n" "$PRETTY_NAME"
 
-  ELEMENT_FQDN="$(ask_required_text "Element public domain (FQDN)" "$default_host")"
-  MATRIX_SERVER_NAME="$(ask_required_text "Matrix server_name (e.g. matrix.example.com)" "$ELEMENT_FQDN")"
-  HOMESERVER_URL="$(ask_required_text "Homeserver base URL" "https://${MATRIX_SERVER_NAME}")"
+  ELEMENT_FQDN="$(ask_required_text "Element public domain (FQDN)" "$default_element_fqdn")"
+  MATRIX_SERVER_NAME="$(ask_required_text "Matrix server_name (e.g. matrix.example.com)" "$default_matrix_name")"
+  HOMESERVER_URL="$(ask_required_text "Homeserver base URL" "$default_homeserver_url")"
   if [[ ! "$HOMESERVER_URL" =~ ^https?:// ]]; then
     warn "Homeserver URL missing scheme, prefixing with https://"
     HOMESERVER_URL="https://${HOMESERVER_URL}"

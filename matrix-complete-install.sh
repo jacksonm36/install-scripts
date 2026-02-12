@@ -16,6 +16,10 @@ ELEMENT_SCRIPT_NAME="element-web-deploy.sh"
 WORK_DIR="${INSTALL_WRAPPER_WORKDIR:-/tmp/matrix-complete-install}"
 MODE=""
 FORCE_DOWNLOAD="false"
+DEFAULT_MATRIX_DOMAIN="${MATRIX_DEFAULT_SERVER_DOMAIN:-matrix.gamedns.hu}"
+DEFAULT_ELEMENT_DOMAIN="${ELEMENT_DEFAULT_PUBLIC_DOMAIN:-chat.gamedns.hu}"
+MATRIX_DOMAIN=""
+ELEMENT_DOMAIN=""
 
 log() { printf '\033[1;32m[INFO]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
@@ -37,6 +41,8 @@ Options:
 Environment variables:
   INSTALL_SCRIPTS_RAW_BASE        Same as --raw-base.
   INSTALL_WRAPPER_WORKDIR         Directory used for downloaded scripts.
+  MATRIX_DEFAULT_SERVER_DOMAIN    Default Matrix server_name shown in prompts.
+  ELEMENT_DEFAULT_PUBLIC_DOMAIN   Default Element domain shown in prompts.
 
 Examples:
   sudo bash matrix-complete-install.sh
@@ -78,6 +84,33 @@ require_root() {
   [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root."
 }
 
+ask_text() {
+  local prompt="$1"
+  local default="${2:-}"
+  local value=""
+  if [[ -n "$default" ]]; then
+    read -r -p "${prompt} [${default}]: " value || true
+    value="${value:-$default}"
+  else
+    read -r -p "${prompt}: " value || true
+  fi
+  printf '%s' "$value"
+}
+
+ask_required_text() {
+  local prompt="$1"
+  local default="${2:-}"
+  local value=""
+  while true; do
+    value="$(ask_text "$prompt" "$default")"
+    if [[ -n "$value" ]]; then
+      printf '%s' "$value"
+      return 0
+    fi
+    warn "Value cannot be empty."
+  done
+}
+
 choose_mode_interactive() {
   printf "\nMatrix Complete Installer v%s\n" "$SCRIPT_VERSION"
   printf "This wrapper runs Synapse and Element installers from one file.\n\n"
@@ -107,6 +140,24 @@ validate_mode() {
       ;;
     *)
       die "Invalid mode '${MODE}'. Use synapse, element, or full."
+      ;;
+  esac
+}
+
+collect_domain_defaults() {
+  printf "\nDomain defaults (editable, press Enter to keep):\n"
+  case "$MODE" in
+    synapse)
+      MATRIX_DOMAIN="$(ask_required_text "Matrix server_name for Synapse" "$DEFAULT_MATRIX_DOMAIN")"
+      ELEMENT_DOMAIN="$DEFAULT_ELEMENT_DOMAIN"
+      ;;
+    element)
+      ELEMENT_DOMAIN="$(ask_required_text "Element public domain" "$DEFAULT_ELEMENT_DOMAIN")"
+      MATRIX_DOMAIN="$(ask_required_text "Matrix server_name for Element" "$DEFAULT_MATRIX_DOMAIN")"
+      ;;
+    full)
+      MATRIX_DOMAIN="$(ask_required_text "Matrix server_name" "$DEFAULT_MATRIX_DOMAIN")"
+      ELEMENT_DOMAIN="$(ask_required_text "Element public domain" "$DEFAULT_ELEMENT_DOMAIN")"
       ;;
   esac
 }
@@ -171,21 +222,31 @@ run_component() {
 run_synapse() {
   local synapse_script
   synapse_script="$(resolve_script "$SYNAPSE_SCRIPT_NAME")"
+  log "Starting Synapse installer: ${synapse_script}"
   if [[ "$MODE" == "full" ]]; then
     log "Full mode: running Synapse without Nginx/firewall (Element will provide web/proxy layer)."
+    SYNAPSE_DEFAULT_SERVER_NAME="$MATRIX_DOMAIN" \
+    SYNAPSE_DEFAULT_PUBLIC_FQDN="$MATRIX_DOMAIN" \
     SYNAPSE_FORCE_INSTALL_NGINX=false \
     SYNAPSE_FORCE_CONFIGURE_FIREWALL=false \
       bash "$synapse_script"
-    log "Synapse installer completed."
   else
-    run_component "Synapse" "$synapse_script"
+    SYNAPSE_DEFAULT_SERVER_NAME="$MATRIX_DOMAIN" \
+    SYNAPSE_DEFAULT_PUBLIC_FQDN="$MATRIX_DOMAIN" \
+      bash "$synapse_script"
   fi
+  log "Synapse installer completed."
 }
 
 run_element() {
   local element_script
   element_script="$(resolve_script "$ELEMENT_SCRIPT_NAME")"
-  run_component "Element Web" "$element_script"
+  log "Starting Element Web installer: ${element_script}"
+  ELEMENT_DEFAULT_PUBLIC_FQDN="$ELEMENT_DOMAIN" \
+  ELEMENT_DEFAULT_MATRIX_SERVER_NAME="$MATRIX_DOMAIN" \
+  ELEMENT_DEFAULT_HOMESERVER_URL="https://${MATRIX_DOMAIN}" \
+    bash "$element_script"
+  log "Element Web installer completed."
 }
 
 main() {
@@ -195,6 +256,7 @@ main() {
   command_exists bash || die "bash is required."
 
   validate_mode
+  collect_domain_defaults
   prepare_workdir
 
   case "$MODE" in
