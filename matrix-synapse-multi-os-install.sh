@@ -57,6 +57,10 @@ FORCE_USE_LETSENCRYPT="${SYNAPSE_FORCE_USE_LETSENCRYPT:-}"
 FORCE_CONFIGURE_FIREWALL="${SYNAPSE_FORCE_CONFIGURE_FIREWALL:-}"
 FORCE_SSH_ALLOWED_CIDR="${SYNAPSE_FORCE_SSH_ALLOWED_CIDR:-}"
 
+# Optional preferred defaults for interactive prompts
+PREFERRED_MATRIX_SERVER_NAME="${SYNAPSE_DEFAULT_SERVER_NAME:-matrix.gamedns.hu}"
+PREFERRED_SYNAPSE_FQDN="${SYNAPSE_DEFAULT_PUBLIC_FQDN:-${PREFERRED_MATRIX_SERVER_NAME}}"
+
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "[ERROR] Please run this script as root." >&2
   exit 1
@@ -240,17 +244,20 @@ pkg_install() {
 }
 
 configure_prompts() {
-  local default_host
+  local default_host default_matrix default_fqdn
   default_host="$(hostname -f 2>/dev/null || hostname)"
   if [[ -z "$default_host" ]]; then
     default_host="matrix.local"
   fi
 
+  default_matrix="${PREFERRED_MATRIX_SERVER_NAME:-$default_host}"
+  default_fqdn="${PREFERRED_SYNAPSE_FQDN:-$default_matrix}"
+
   printf "\nMatrix Synapse interactive installer v%s\n" "$SCRIPT_VERSION"
   printf "Detected OS: %s\n\n" "$PRETTY_NAME"
 
-  SERVER_NAME="$(ask_required_text "Matrix server_name (for @user:server_name)" "$default_host")"
-  SYNAPSE_FQDN="$(ask_required_text "Public Synapse hostname (DNS A/AAAA record)" "$SERVER_NAME")"
+  SERVER_NAME="$(ask_required_text "Matrix server_name (for @user:server_name)" "$default_matrix")"
+  SYNAPSE_FQDN="$(ask_required_text "Public Synapse hostname (DNS A/AAAA record)" "$default_fqdn")"
 
   printf "\nChoose database backend:\n"
   printf "  1) PostgreSQL (recommended, officially supported)\n"
