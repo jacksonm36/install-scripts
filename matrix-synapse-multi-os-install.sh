@@ -402,7 +402,7 @@ ensure_postgres_running() {
   systemctl enable --now postgresql 2>/dev/null || true
   if ! systemctl is-active --quiet postgresql; then
     local pg_unit
-    pg_unit="$(systemctl list-unit-files --type=service --no-legend | awk '{print $1}' | rg '^postgresql' | awk 'NR==1{gsub(/\.service$/,""); print; exit}')"
+    pg_unit="$(systemctl list-unit-files --type=service --no-legend | awk '{print $1}' | awk '/^postgresql/ {gsub(/\.service$/,""); print; exit}')"
     [[ -n "$pg_unit" ]] || die "Could not find a PostgreSQL systemd unit."
     systemctl enable --now "$pg_unit"
   fi
@@ -436,8 +436,13 @@ END
 \$\$;
 SQL
 
-  if ! runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname='${esc_db}'" | rg -q '^1$'; then
-    runuser -u postgres -- createdb --encoding=UTF8 --owner="$DB_USER" "$DB_NAME"
+  local db_exists
+  db_exists="$(runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname='${esc_db}'" | tr -d '[:space:]')"
+  if [[ "$db_exists" != "1" ]]; then
+    if ! runuser -u postgres -- createdb --template=template0 --encoding=UTF8 --owner="$DB_USER" "$DB_NAME"; then
+      warn "UTF8 database creation failed; retrying without explicit encoding using template0."
+      runuser -u postgres -- createdb --template=template0 --owner="$DB_USER" "$DB_NAME"
+    fi
   fi
 
   runuser -u postgres -- psql -v ON_ERROR_STOP=1 -c "GRANT ALL PRIVILEGES ON DATABASE \"${DB_NAME}\" TO \"${DB_USER}\";"
