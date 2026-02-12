@@ -973,6 +973,7 @@ create_admin_user() {
 resolve_element_tag_from_ess_helm() {
   local chart_tag="$1"
   local chart_url chart_file
+  chart_tag="$(printf '%s' "$chart_tag" | awk '{$1=$1; print}')"
 
   # Fast-path known mapping to avoid network stalls during install.
   case "$chart_tag" in
@@ -995,7 +996,6 @@ resolve_element_tag_from_ess_helm() {
 
   python3 - "$chart_file" <<'PY'
 import io
-import re
 import sys
 import tarfile
 
@@ -1014,24 +1014,52 @@ with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as tar:
         raise SystemExit("Could not find values.yaml in ESS helm chart.")
     values_text = tar.extractfile(values_member).read().decode("utf-8", "ignore")
 
-match = re.search(
-    r"(?ms)^elementWeb:\n(?:^[ \t].*\n)*?^[ \t]{2}image:\n(?:^[ \t].*\n)*?^[ \t]{4}tag:\s*[\"']?([^\"'\n#]+)",
-    values_text,
-)
-if not match:
-    raise SystemExit("Could not extract elementWeb.image.tag from ESS values.yaml")
-print(match.group(1).strip())
+in_element_web = False
+in_image = False
+
+for raw_line in values_text.splitlines():
+    line = raw_line.expandtabs(2)
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        continue
+
+    indent = len(line) - len(line.lstrip(" "))
+
+    if indent == 0:
+        if stripped.startswith("elementWeb:"):
+            in_element_web = True
+            in_image = False
+            continue
+        if in_element_web:
+            break
+
+    if not in_element_web:
+        continue
+
+    if indent == 2 and stripped.startswith("image:"):
+        in_image = True
+        continue
+    if indent == 2 and not stripped.startswith("image:"):
+        in_image = False
+
+    if in_image and indent >= 4 and stripped.startswith("tag:"):
+        value = stripped.split(":", 1)[1].split("#", 1)[0].strip().strip("\"'")
+        if value:
+            print(value)
+            raise SystemExit(0)
+
+raise SystemExit("Could not extract elementWeb.image.tag from ESS values.yaml")
 PY
   rm -f "$chart_file" || true
 }
 
 resolve_element_asset() {
   local req chart_tag chart_url metadata api_url
-  req="${ELEMENT_VERSION_REQUEST}"
+  req="$(printf '%s' "$ELEMENT_VERSION_REQUEST" | awk '{$1=$1; print}')"
   api_url="https://api.github.com/repos/element-hq/element-web/releases/latest"
   chart_tag=""
 
-  if [[ "$req" =~ ^https://github.com/element-hq/ess-helm/releases/tag/([^/]+)$ ]]; then
+  if [[ "$req" =~ ^https://github\.com/element-hq/ess-helm/releases/tag/([^/]+)/*$ ]]; then
     chart_tag="${BASH_REMATCH[1]}"
   elif [[ "$req" =~ ^ess-helm:(.+)$ ]]; then
     chart_tag="${BASH_REMATCH[1]}"
