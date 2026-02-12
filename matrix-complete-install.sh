@@ -944,12 +944,29 @@ EOF
 
 create_admin_user() {
   [[ "$SYNAPSE_CREATE_ADMIN" == "true" ]] || return 0
-  "${SYNAPSE_VENV}/bin/register_new_matrix_user" \
+  local output rc
+  set +e
+  output="$("${SYNAPSE_VENV}/bin/register_new_matrix_user" \
     -u "$SYNAPSE_ADMIN_USER" \
     -p "$SYNAPSE_ADMIN_PASS" \
     -a \
     -k "$SYNAPSE_REGISTRATION_SHARED_SECRET" \
-    "http://127.0.0.1:8008"
+    "http://127.0.0.1:8008" 2>&1)"
+  rc=$?
+  set -e
+
+  if [[ "$rc" -eq 0 ]]; then
+    log "Admin user @${SYNAPSE_ADMIN_USER}:${MATRIX_DOMAIN} created."
+    return 0
+  fi
+
+  if [[ "$output" == *"User ID already taken"* || "$output" == *"already exists"* ]]; then
+    warn "Admin user @${SYNAPSE_ADMIN_USER}:${MATRIX_DOMAIN} already exists; continuing."
+    return 0
+  fi
+
+  printf '%s\n' "$output" >&2
+  die "Admin user creation failed."
 }
 
 resolve_element_tag_from_ess_helm() {
