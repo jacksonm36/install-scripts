@@ -711,8 +711,8 @@ configure_nginx() {
   # Bootstrap HTTP config first (used for ACME challenge and initial startup).
   cat >/etc/nginx/conf.d/matrix-synapse-bootstrap.conf <<EOF
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
+    listen 80;
+    listen [::]:80;
     server_name ${SYNAPSE_FQDN} _;
 
     location ^~ /.well-known/acme-challenge/ {
@@ -757,8 +757,8 @@ EOF
 # Matrix Synapse reverse proxy
 
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
+    listen 80;
+    listen [::]:80;
     server_name ${SYNAPSE_FQDN} _;
 
     location ^~ /.well-known/acme-challenge/ {
@@ -781,8 +781,8 @@ server {
 }
 
 server {
-    listen 443 ssl http2 default_server;
-    listen [::]:443 ssl http2 default_server;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name ${SYNAPSE_FQDN} _;
 
     ssl_certificate ${TLS_CERT_FILE};
@@ -814,8 +814,8 @@ server {
 }
 
 server {
-    listen 8448 ssl http2 default_server;
-    listen [::]:8448 ssl http2 default_server;
+    listen 8448 ssl http2;
+    listen [::]:8448 ssl http2;
     server_name ${SYNAPSE_FQDN} _;
 
     ssl_certificate ${TLS_CERT_FILE};
