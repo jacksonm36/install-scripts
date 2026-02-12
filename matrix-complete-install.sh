@@ -51,6 +51,7 @@ TURN_SHARED_SECRET=""
 ELEMENT_VERSION_REQUEST=""
 ELEMENT_RESOLVED_TAG=""
 ELEMENT_VERSION_SOURCE=""
+ELEMENT_ASSET_URL=""
 ELEMENT_HOMESERVER_URL=""
 ELEMENT_PROXY_MATRIX_ENDPOINTS="false"
 ELEMENT_SYNAPSE_UPSTREAM="http://127.0.0.1:8008"
@@ -970,17 +971,38 @@ create_admin_user() {
 }
 
 resolve_element_tag_from_ess_helm() {
-  local chart_url="$1"
-  python3 - "$chart_url" <<'PY'
+  local chart_tag="$1"
+  local chart_url chart_file
+
+  # Fast-path known mapping to avoid network stalls during install.
+  case "$chart_tag" in
+    26.2.0)
+      printf 'v1.12.9\n'
+      return 0
+      ;;
+  esac
+
+  chart_url="https://github.com/element-hq/ess-helm/releases/download/${chart_tag}/matrix-stack-${chart_tag}.tgz"
+  chart_file="/tmp/matrix-stack-${chart_tag}.tgz"
+
+  log "Resolving Element tag from ESS Helm release ${chart_tag}..."
+  curl -fsSL \
+    --connect-timeout 15 \
+    --max-time 120 \
+    --retry 3 \
+    --retry-delay 3 \
+    "$chart_url" -o "$chart_file" || die "Failed to download ESS helm chart ${chart_tag}. Use explicit Element tag instead (e.g. v1.12.9)."
+
+  python3 - "$chart_file" <<'PY'
 import io
 import re
 import sys
 import tarfile
-import urllib.request
 
-chart_url = sys.argv[1]
-with urllib.request.urlopen(chart_url, timeout=40) as response:
-    content = response.read()
+chart_file = sys.argv[1]
+
+with open(chart_file, "rb") as fh:
+    content = fh.read()
 
 with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as tar:
     values_member = None
@@ -1000,6 +1022,7 @@ if not match:
     raise SystemExit("Could not extract elementWeb.image.tag from ESS values.yaml")
 print(match.group(1).strip())
 PY
+  rm -f "$chart_file" || true
 }
 
 resolve_element_asset() {
@@ -1015,15 +1038,15 @@ resolve_element_asset() {
   fi
 
   if [[ -n "$chart_tag" ]]; then
-    chart_url="https://github.com/element-hq/ess-helm/releases/download/${chart_tag}/matrix-stack-${chart_tag}.tgz"
-    ELEMENT_RESOLVED_TAG="$(resolve_element_tag_from_ess_helm "$chart_url")"
+    ELEMENT_RESOLVED_TAG="$(resolve_element_tag_from_ess_helm "$chart_tag")"
     ELEMENT_VERSION_SOURCE="ess-helm:${chart_tag}"
     ELEMENT_ASSET_URL="https://github.com/element-hq/element-web/releases/download/${ELEMENT_RESOLVED_TAG}/element-${ELEMENT_RESOLVED_TAG}.tar.gz"
+    log "Resolved Element ${ELEMENT_RESOLVED_TAG} from ${ELEMENT_VERSION_SOURCE}"
     return 0
   fi
 
   if [[ "${req,,}" == "latest" ]]; then
-    metadata="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$api_url")"
+    metadata="$(curl -fsSL --connect-timeout 15 --max-time 60 -H 'Accept: application/vnd.github+json' "$api_url")"
     ELEMENT_RESOLVED_TAG="$(printf '%s\n' "$metadata" | jq -r '.tag_name')"
     [[ -n "$ELEMENT_RESOLVED_TAG" && "$ELEMENT_RESOLVED_TAG" != "null" ]] || die "Could not resolve latest Element release tag."
     ELEMENT_ASSET_URL="$(printf '%s\n' "$metadata" | jq -r '.assets[] | select(.name | test("^element-.*\\.tar\\.gz$")) | .browser_download_url' | awk 'NR==1{print; exit}')"
@@ -1044,7 +1067,13 @@ install_element_files() {
   resolve_element_asset
   local archive
   archive="/tmp/element-${ELEMENT_RESOLVED_TAG}.tar.gz"
-  curl -fL "$ELEMENT_ASSET_URL" -o "$archive"
+  log "Downloading Element archive ${ELEMENT_RESOLVED_TAG}..."
+  curl -fL \
+    --connect-timeout 15 \
+    --max-time 600 \
+    --retry 3 \
+    --retry-delay 3 \
+    "$ELEMENT_ASSET_URL" -o "$archive" || die "Failed downloading Element archive from ${ELEMENT_ASSET_URL}"
   mkdir -p "$ELEMENT_ROOT"
   find "$ELEMENT_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
   tar -xzf "$archive" --strip-components=1 -C "$ELEMENT_ROOT"
