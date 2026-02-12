@@ -18,8 +18,10 @@ MODE=""
 FORCE_DOWNLOAD="false"
 DEFAULT_MATRIX_DOMAIN="${MATRIX_DEFAULT_SERVER_DOMAIN:-matrix.gamedns.hu}"
 DEFAULT_ELEMENT_DOMAIN="${ELEMENT_DEFAULT_PUBLIC_DOMAIN:-chat.gamedns.hu}"
+DEFAULT_EXTERNAL_REVERSE_PROXY="${MATRIX_DEFAULT_EXTERNAL_REVERSE_PROXY:-true}"
 MATRIX_DOMAIN=""
 ELEMENT_DOMAIN=""
+EXTERNAL_REVERSE_PROXY="true"
 
 log() { printf '\033[1;32m[INFO]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
@@ -43,6 +45,7 @@ Environment variables:
   INSTALL_WRAPPER_WORKDIR         Directory used for downloaded scripts.
   MATRIX_DEFAULT_SERVER_DOMAIN    Default Matrix server_name shown in prompts.
   ELEMENT_DEFAULT_PUBLIC_DOMAIN   Default Element domain shown in prompts.
+  MATRIX_DEFAULT_EXTERNAL_REVERSE_PROXY  Default reverse-proxy mode (true/false).
 
 Examples:
   sudo bash matrix-complete-install.sh
@@ -111,6 +114,25 @@ ask_required_text() {
   done
 }
 
+ask_yes_no() {
+  local prompt="$1"
+  local default="${2:-y}"
+  local suffix="[Y/n]"
+  local answer=""
+  if [[ "${default,,}" == "n" ]]; then
+    suffix="[y/N]"
+  fi
+  while true; do
+    read -r -p "${prompt} ${suffix}: " answer || true
+    answer="${answer:-$default}"
+    case "${answer,,}" in
+      y|yes) return 0 ;;
+      n|no) return 1 ;;
+      *) warn "Please answer yes or no." ;;
+    esac
+  done
+}
+
 choose_mode_interactive() {
   printf "\nMatrix Complete Installer v%s\n" "$SCRIPT_VERSION"
   printf "This wrapper runs Synapse and Element installers from one file.\n\n"
@@ -145,6 +167,17 @@ validate_mode() {
 }
 
 collect_domain_defaults() {
+  local reverse_proxy_default="y"
+  case "${DEFAULT_EXTERNAL_REVERSE_PROXY,,}" in
+    0|false|no|n) reverse_proxy_default="n" ;;
+  esac
+
+  if ask_yes_no "Use external reverse proxy in front of this server?" "$reverse_proxy_default"; then
+    EXTERNAL_REVERSE_PROXY="true"
+  else
+    EXTERNAL_REVERSE_PROXY="false"
+  fi
+
   printf "\nDomain defaults (editable, press Enter to keep):\n"
   case "$MODE" in
     synapse)
@@ -221,18 +254,34 @@ run_component() {
 
 run_synapse() {
   local synapse_script
+  local synapse_force_public_baseurl=""
   synapse_script="$(resolve_script "$SYNAPSE_SCRIPT_NAME")"
   log "Starting Synapse installer: ${synapse_script}"
+
+  if [[ "$EXTERNAL_REVERSE_PROXY" == "true" ]]; then
+    synapse_force_public_baseurl="https://${MATRIX_DOMAIN}/"
+  fi
+
   if [[ "$MODE" == "full" ]]; then
     log "Full mode: running Synapse without Nginx/firewall (Element will provide web/proxy layer)."
     SYNAPSE_DEFAULT_SERVER_NAME="$MATRIX_DOMAIN" \
     SYNAPSE_DEFAULT_PUBLIC_FQDN="$MATRIX_DOMAIN" \
+    SYNAPSE_FORCE_EXTERNAL_REVERSE_PROXY="$EXTERNAL_REVERSE_PROXY" \
+    SYNAPSE_FORCE_PUBLIC_BASEURL="$synapse_force_public_baseurl" \
     SYNAPSE_FORCE_INSTALL_NGINX=false \
     SYNAPSE_FORCE_CONFIGURE_FIREWALL=false \
+      bash "$synapse_script"
+  elif [[ "$EXTERNAL_REVERSE_PROXY" == "true" ]]; then
+    SYNAPSE_DEFAULT_SERVER_NAME="$MATRIX_DOMAIN" \
+    SYNAPSE_DEFAULT_PUBLIC_FQDN="$MATRIX_DOMAIN" \
+    SYNAPSE_FORCE_EXTERNAL_REVERSE_PROXY=true \
+    SYNAPSE_FORCE_PUBLIC_BASEURL="$synapse_force_public_baseurl" \
+    SYNAPSE_FORCE_INSTALL_NGINX=false \
       bash "$synapse_script"
   else
     SYNAPSE_DEFAULT_SERVER_NAME="$MATRIX_DOMAIN" \
     SYNAPSE_DEFAULT_PUBLIC_FQDN="$MATRIX_DOMAIN" \
+    SYNAPSE_FORCE_EXTERNAL_REVERSE_PROXY=false \
       bash "$synapse_script"
   fi
   log "Synapse installer completed."
@@ -245,6 +294,7 @@ run_element() {
   ELEMENT_DEFAULT_PUBLIC_FQDN="$ELEMENT_DOMAIN" \
   ELEMENT_DEFAULT_MATRIX_SERVER_NAME="$MATRIX_DOMAIN" \
   ELEMENT_DEFAULT_HOMESERVER_URL="https://${MATRIX_DOMAIN}" \
+  ELEMENT_FORCE_EXTERNAL_REVERSE_PROXY="$EXTERNAL_REVERSE_PROXY" \
     bash "$element_script"
   log "Element Web installer completed."
 }

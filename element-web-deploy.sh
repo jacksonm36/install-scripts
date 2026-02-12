@@ -28,6 +28,7 @@ LETSENCRYPT_EMAIL=""
 CONFIGURE_FIREWALL="true"
 OPEN_FEDERATION_PORT="false"
 DISABLE_NGINX_DEFAULT="true"
+EXTERNAL_REVERSE_PROXY="true"
 
 ELEMENT_ROOT="/var/www/element"
 NGINX_CONF="/etc/nginx/conf.d/element-web.conf"
@@ -44,6 +45,7 @@ WEB_GROUP="www-data"
 PREFERRED_ELEMENT_FQDN="${ELEMENT_DEFAULT_PUBLIC_FQDN:-chat.gamedns.hu}"
 PREFERRED_MATRIX_SERVER_NAME="${ELEMENT_DEFAULT_MATRIX_SERVER_NAME:-matrix.gamedns.hu}"
 PREFERRED_HOMESERVER_URL="${ELEMENT_DEFAULT_HOMESERVER_URL:-https://${PREFERRED_MATRIX_SERVER_NAME}}"
+FORCE_EXTERNAL_REVERSE_PROXY="${ELEMENT_FORCE_EXTERNAL_REVERSE_PROXY:-}"
 
 log() { printf '\033[1;32m[INFO]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
@@ -195,6 +197,7 @@ pkg_install() {
 
 collect_inputs() {
   local default_host default_element_fqdn default_matrix_name default_homeserver_url
+  local proxy_matrix_default
   default_host="$(hostname -f 2>/dev/null || hostname)"
   [[ -n "$default_host" ]] || default_host="chat.example.com"
   default_element_fqdn="${PREFERRED_ELEMENT_FQDN:-$default_host}"
@@ -213,26 +216,57 @@ collect_inputs() {
   fi
   HOMESERVER_URL="${HOMESERVER_URL%/}"
 
+  if [[ -n "$FORCE_EXTERNAL_REVERSE_PROXY" ]]; then
+    case "${FORCE_EXTERNAL_REVERSE_PROXY,,}" in
+      1|true|yes|y)
+        EXTERNAL_REVERSE_PROXY="true"
+        log "External reverse proxy mode forced ON by ELEMENT_FORCE_EXTERNAL_REVERSE_PROXY=${FORCE_EXTERNAL_REVERSE_PROXY}"
+        ;;
+      0|false|no|n)
+        EXTERNAL_REVERSE_PROXY="false"
+        log "External reverse proxy mode forced OFF by ELEMENT_FORCE_EXTERNAL_REVERSE_PROXY=${FORCE_EXTERNAL_REVERSE_PROXY}"
+        ;;
+      *)
+        die "Invalid ELEMENT_FORCE_EXTERNAL_REVERSE_PROXY value: ${FORCE_EXTERNAL_REVERSE_PROXY} (use true/false)"
+        ;;
+    esac
+  elif ask_yes_no "Use an external reverse proxy in front of Element?" "y"; then
+    EXTERNAL_REVERSE_PROXY="true"
+  else
+    EXTERNAL_REVERSE_PROXY="false"
+  fi
+
   ELEMENT_VERSION="$(ask_text "Element version tag (e.g. v1.12.10) or 'latest'" "latest")"
   ELEMENT_VERSION="${ELEMENT_VERSION:-latest}"
 
-  if ask_yes_no "Proxy Matrix API endpoints (/_matrix, /_synapse/client) via this Nginx?" "y"; then
+  proxy_matrix_default="y"
+  if [[ "$EXTERNAL_REVERSE_PROXY" == "true" ]]; then
+    proxy_matrix_default="n"
+  fi
+
+  if ask_yes_no "Proxy Matrix API endpoints (/_matrix, /_synapse/client) via this Nginx?" "$proxy_matrix_default"; then
     PROXY_MATRIX_ENDPOINTS="true"
     SYNAPSE_UPSTREAM="$(ask_required_text "Local Synapse upstream URL" "http://127.0.0.1:8008")"
     SYNAPSE_UPSTREAM="${SYNAPSE_UPSTREAM%/}"
   fi
 
-  if ask_yes_no "Enable TLS (HTTPS)?" "y"; then
-    INSTALL_TLS="true"
-    if ask_yes_no "Use Let's Encrypt?" "y"; then
-      USE_LETSENCRYPT="true"
-      LETSENCRYPT_EMAIL="$(ask_required_text "Let's Encrypt email" "admin@${ELEMENT_FQDN}")"
-    else
-      USE_LETSENCRYPT="false"
-    fi
-  else
+  if [[ "$EXTERNAL_REVERSE_PROXY" == "true" ]]; then
     INSTALL_TLS="false"
     USE_LETSENCRYPT="false"
+    log "External reverse proxy mode enabled: backend TLS is disabled, proxy should terminate HTTPS."
+  else
+    if ask_yes_no "Enable TLS (HTTPS)?" "y"; then
+      INSTALL_TLS="true"
+      if ask_yes_no "Use Let's Encrypt?" "y"; then
+        USE_LETSENCRYPT="true"
+        LETSENCRYPT_EMAIL="$(ask_required_text "Let's Encrypt email" "admin@${ELEMENT_FQDN}")"
+      else
+        USE_LETSENCRYPT="false"
+      fi
+    else
+      INSTALL_TLS="false"
+      USE_LETSENCRYPT="false"
+    fi
   fi
 
   if [[ "$PROXY_MATRIX_ENDPOINTS" == "true" && "$INSTALL_TLS" == "true" ]]; then
@@ -480,7 +514,7 @@ EOF
 }
 
 disable_stale_synapse_nginx_configs_if_proxying() {
-  if [[ "$PROXY_MATRIX_ENDPOINTS" != "true" ]]; then
+  if [[ "$PROXY_MATRIX_ENDPOINTS" != "true" && "$EXTERNAL_REVERSE_PROXY" != "true" ]]; then
     return 0
   fi
 
@@ -618,6 +652,7 @@ Matrix server_name: ${MATRIX_SERVER_NAME}
 Homeserver URL: ${HOMESERVER_URL}
 Proxy Matrix API endpoints: ${PROXY_MATRIX_ENDPOINTS}
 Synapse upstream: ${SYNAPSE_UPSTREAM}
+External reverse proxy mode: ${EXTERNAL_REVERSE_PROXY}
 
 TLS enabled: ${INSTALL_TLS}
 Let's Encrypt used: ${USE_LETSENCRYPT}
@@ -643,6 +678,7 @@ print_final_notes() {
   log "Element Web deployment completed."
   printf "  - UI URL:            %s\n" "$ui_url"
   printf "  - Homeserver URL:    %s\n" "$HOMESERVER_URL"
+  printf "  - External proxy:    %s\n" "$EXTERNAL_REVERSE_PROXY"
   printf "  - Matrix proxy mode: %s\n" "$PROXY_MATRIX_ENDPOINTS"
   printf "  - Summary file:      %s\n\n" "$SUMMARY_FILE"
 }

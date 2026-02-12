@@ -39,6 +39,7 @@ CONFIGURE_FIREWALL="false"
 INSTALL_FAIL2BAN="false"
 ENABLE_REGISTRATION="false"
 ALLOW_UNVERIFIED_REGISTRATION="false"
+EXTERNAL_REVERSE_PROXY="true"
 CREATE_ADMIN_USER="false"
 ADMIN_USERNAME=""
 ADMIN_PASSWORD=""
@@ -56,6 +57,8 @@ FORCE_INSTALL_NGINX="${SYNAPSE_FORCE_INSTALL_NGINX:-}"
 FORCE_USE_LETSENCRYPT="${SYNAPSE_FORCE_USE_LETSENCRYPT:-}"
 FORCE_CONFIGURE_FIREWALL="${SYNAPSE_FORCE_CONFIGURE_FIREWALL:-}"
 FORCE_SSH_ALLOWED_CIDR="${SYNAPSE_FORCE_SSH_ALLOWED_CIDR:-}"
+FORCE_EXTERNAL_REVERSE_PROXY="${SYNAPSE_FORCE_EXTERNAL_REVERSE_PROXY:-}"
+FORCE_PUBLIC_BASEURL="${SYNAPSE_FORCE_PUBLIC_BASEURL:-}"
 
 # Optional preferred defaults for interactive prompts
 PREFERRED_MATRIX_SERVER_NAME="${SYNAPSE_DEFAULT_SERVER_NAME:-matrix.gamedns.hu}"
@@ -298,23 +301,49 @@ configure_prompts() {
     die "Database user must match: ^[A-Za-z_][A-Za-z0-9_]*$"
   fi
 
-  if [[ -n "$FORCE_INSTALL_NGINX" ]]; then
-    case "${FORCE_INSTALL_NGINX,,}" in
+  if [[ -n "$FORCE_EXTERNAL_REVERSE_PROXY" ]]; then
+    case "${FORCE_EXTERNAL_REVERSE_PROXY,,}" in
       1|true|yes|y)
-        INSTALL_NGINX="true"
-        log "Nginx install forced by SYNAPSE_FORCE_INSTALL_NGINX=${FORCE_INSTALL_NGINX}"
+        EXTERNAL_REVERSE_PROXY="true"
+        log "External reverse proxy mode forced ON by SYNAPSE_FORCE_EXTERNAL_REVERSE_PROXY=${FORCE_EXTERNAL_REVERSE_PROXY}"
         ;;
       0|false|no|n)
-        INSTALL_NGINX="false"
-        USE_LETSENCRYPT="false"
-        log "Nginx install forced OFF by SYNAPSE_FORCE_INSTALL_NGINX=${FORCE_INSTALL_NGINX}"
+        EXTERNAL_REVERSE_PROXY="false"
+        log "External reverse proxy mode forced OFF by SYNAPSE_FORCE_EXTERNAL_REVERSE_PROXY=${FORCE_EXTERNAL_REVERSE_PROXY}"
         ;;
       *)
-        die "Invalid SYNAPSE_FORCE_INSTALL_NGINX value: ${FORCE_INSTALL_NGINX} (use true/false)"
+        die "Invalid SYNAPSE_FORCE_EXTERNAL_REVERSE_PROXY value: ${FORCE_EXTERNAL_REVERSE_PROXY} (use true/false)"
         ;;
     esac
-  elif ask_yes_no "Install and configure Nginx reverse proxy + TLS?" "y"; then
-    INSTALL_NGINX="true"
+  elif ask_yes_no "Use an external reverse proxy in front of Synapse?" "y"; then
+    EXTERNAL_REVERSE_PROXY="true"
+  else
+    EXTERNAL_REVERSE_PROXY="false"
+  fi
+
+  if [[ "$EXTERNAL_REVERSE_PROXY" == "true" && -z "$FORCE_INSTALL_NGINX" ]]; then
+    INSTALL_NGINX="false"
+    USE_LETSENCRYPT="false"
+    log "External reverse proxy mode enabled: local Synapse Nginx is disabled."
+  else
+    if [[ -n "$FORCE_INSTALL_NGINX" ]]; then
+      case "${FORCE_INSTALL_NGINX,,}" in
+        1|true|yes|y)
+          INSTALL_NGINX="true"
+          log "Nginx install forced by SYNAPSE_FORCE_INSTALL_NGINX=${FORCE_INSTALL_NGINX}"
+          ;;
+        0|false|no|n)
+          INSTALL_NGINX="false"
+          USE_LETSENCRYPT="false"
+          log "Nginx install forced OFF by SYNAPSE_FORCE_INSTALL_NGINX=${FORCE_INSTALL_NGINX}"
+          ;;
+        *)
+          die "Invalid SYNAPSE_FORCE_INSTALL_NGINX value: ${FORCE_INSTALL_NGINX} (use true/false)"
+          ;;
+      esac
+    elif ask_yes_no "Install and configure Nginx reverse proxy + TLS?" "y"; then
+      INSTALL_NGINX="true"
+    fi
   fi
 
   if [[ "$INSTALL_NGINX" == "true" ]]; then
@@ -347,6 +376,12 @@ configure_prompts() {
     TURN_SHARED_SECRET="$(gen_alnum 48)"
   fi
 
+  local firewall_default
+  firewall_default="y"
+  if [[ "$EXTERNAL_REVERSE_PROXY" == "true" ]]; then
+    firewall_default="n"
+  fi
+
   if [[ -n "$FORCE_CONFIGURE_FIREWALL" ]]; then
     case "${FORCE_CONFIGURE_FIREWALL,,}" in
       1|true|yes|y)
@@ -366,7 +401,7 @@ configure_prompts() {
         die "Invalid SYNAPSE_FORCE_CONFIGURE_FIREWALL value: ${FORCE_CONFIGURE_FIREWALL} (use true/false)"
         ;;
     esac
-  elif ask_yes_no "Configure firewall automatically?" "y"; then
+  elif ask_yes_no "Configure firewall automatically?" "$firewall_default"; then
     CONFIGURE_FIREWALL="true"
     SSH_ALLOWED_CIDR="$(ask_text "Allow SSH from CIDR (or 'any')" "any")"
   fi
@@ -390,11 +425,14 @@ configure_prompts() {
   fi
 
   REGISTRATION_SHARED_SECRET="$(gen_alnum 48)"
-  if [[ "$INSTALL_NGINX" == "true" ]]; then
+  if [[ -n "$FORCE_PUBLIC_BASEURL" ]]; then
+    PUBLIC_BASEURL="$FORCE_PUBLIC_BASEURL"
+  elif [[ "$EXTERNAL_REVERSE_PROXY" == "true" || "$INSTALL_NGINX" == "true" ]]; then
     PUBLIC_BASEURL="https://${SYNAPSE_FQDN}/"
   else
     PUBLIC_BASEURL="http://${SYNAPSE_FQDN}:8008/"
   fi
+  [[ "$PUBLIC_BASEURL" =~ /$ ]] || PUBLIC_BASEURL="${PUBLIC_BASEURL}/"
 }
 
 install_system_packages() {
@@ -607,7 +645,7 @@ generate_or_update_synapse_config() {
     synapse_log_config="${SYNAPSE_ETC}/log.config"
   fi
 
-  export SYNAPSE_CONFIG DB_BACKEND DB_NAME DB_USER DB_PASS INSTALL_NGINX PUBLIC_BASEURL
+  export SYNAPSE_CONFIG DB_BACKEND DB_NAME DB_USER DB_PASS INSTALL_NGINX PUBLIC_BASEURL EXTERNAL_REVERSE_PROXY
   export ENABLE_REGISTRATION ALLOW_UNVERIFIED_REGISTRATION REGISTRATION_SHARED_SECRET
   export INSTALL_COTURN TURN_HOST TURN_SHARED_SECRET
   export SYNAPSE_LOG_CONFIG="$synapse_log_config"
@@ -650,14 +688,16 @@ elif db_backend == "mariadb":
     }
 
 use_nginx = os.environ["INSTALL_NGINX"] == "true"
+external_proxy = os.environ.get("EXTERNAL_REVERSE_PROXY", "false") == "true"
 bind_addresses = ["127.0.0.1"] if use_nginx else ["0.0.0.0"]
+x_forwarded = use_nginx or external_proxy
 
 config["listeners"] = [
     {
         "port": 8008,
         "tls": False,
         "type": "http",
-        "x_forwarded": use_nginx,
+        "x_forwarded": x_forwarded,
         "bind_addresses": bind_addresses,
         "resources": [{"names": ["client", "federation"], "compress": False}],
     }
@@ -1117,6 +1157,7 @@ Database user: ${DB_USER}
 Database password: ${DB_PASS}
 
 Nginx installed: ${INSTALL_NGINX}
+External reverse proxy mode: ${EXTERNAL_REVERSE_PROXY}
 Let's Encrypt used: ${USE_LETSENCRYPT}
 TLS certificate: ${TLS_CERT_FILE:-not-set}
 TLS private key: ${TLS_KEY_FILE:-not-set}
