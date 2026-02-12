@@ -17,6 +17,7 @@ PRETTY_NAME=""
 
 ELEMENT_VERSION="latest"
 ELEMENT_TAG=""
+ELEMENT_VERSION_SOURCE=""
 ELEMENT_FQDN=""
 MATRIX_SERVER_NAME=""
 HOMESERVER_URL=""
@@ -45,6 +46,8 @@ WEB_GROUP="www-data"
 PREFERRED_ELEMENT_FQDN="${ELEMENT_DEFAULT_PUBLIC_FQDN:-chat.gamedns.hu}"
 PREFERRED_MATRIX_SERVER_NAME="${ELEMENT_DEFAULT_MATRIX_SERVER_NAME:-matrix.gamedns.hu}"
 PREFERRED_HOMESERVER_URL="${ELEMENT_DEFAULT_HOMESERVER_URL:-https://${PREFERRED_MATRIX_SERVER_NAME}}"
+PREFERRED_ESS_HELM_RELEASE="${ELEMENT_DEFAULT_ESS_HELM_RELEASE:-26.2.0}"
+PREFERRED_ELEMENT_VERSION="${ELEMENT_DEFAULT_VERSION:-ess-helm:${PREFERRED_ESS_HELM_RELEASE}}"
 FORCE_EXTERNAL_REVERSE_PROXY="${ELEMENT_FORCE_EXTERNAL_REVERSE_PROXY:-}"
 
 log() { printf '\033[1;32m[INFO]\033[0m %s\n' "$*"; }
@@ -236,7 +239,7 @@ collect_inputs() {
     EXTERNAL_REVERSE_PROXY="false"
   fi
 
-  ELEMENT_VERSION="$(ask_text "Element version tag (e.g. v1.12.10) or 'latest'" "latest")"
+  ELEMENT_VERSION="$(ask_text "Element version ('latest', element tag, 'ess-helm:<release>', or ESS release URL)" "$PREFERRED_ELEMENT_VERSION")"
   ELEMENT_VERSION="${ELEMENT_VERSION:-latest}"
 
   proxy_matrix_default="y"
@@ -308,24 +311,80 @@ install_packages() {
 }
 
 resolve_element_asset() {
-  local metadata api_url
+  local metadata api_url version_request chart_tag chart_url
   api_url="https://api.github.com/repos/element-hq/element-web/releases/latest"
+  version_request="${ELEMENT_VERSION}"
 
-  if [[ "${ELEMENT_VERSION,,}" == "latest" ]]; then
+  chart_tag=""
+  if [[ "$version_request" =~ ^https://github.com/element-hq/ess-helm/releases/tag/([^/]+)$ ]]; then
+    chart_tag="${BASH_REMATCH[1]}"
+  elif [[ "$version_request" =~ ^ess-helm:(.+)$ ]]; then
+    chart_tag="${BASH_REMATCH[1]}"
+  fi
+
+  if [[ -n "$chart_tag" ]]; then
+    chart_url="https://github.com/element-hq/ess-helm/releases/download/${chart_tag}/matrix-stack-${chart_tag}.tgz"
+    ELEMENT_TAG="$(resolve_element_tag_from_ess_helm "$chart_url")"
+    ELEMENT_VERSION_SOURCE="ess-helm:${chart_tag}"
+    ELEMENT_ASSET_URL="https://github.com/element-hq/element-web/releases/download/${ELEMENT_TAG}/element-${ELEMENT_TAG}.tar.gz"
+    log "Resolved Element version ${ELEMENT_TAG} from ${ELEMENT_VERSION_SOURCE}"
+    return 0
+  fi
+
+  if [[ "${version_request,,}" == "latest" ]]; then
     metadata="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$api_url")"
     ELEMENT_TAG="$(printf '%s\n' "$metadata" | jq -r '.tag_name')"
     [[ -n "$ELEMENT_TAG" && "$ELEMENT_TAG" != "null" ]] || die "Could not resolve latest Element release tag."
     ELEMENT_ASSET_URL="$(printf '%s\n' "$metadata" | jq -r '.assets[] | select(.name | test("^element-.*\\.tar\\.gz$")) | .browser_download_url' | awk 'NR==1{print; exit}')"
+    ELEMENT_VERSION_SOURCE="element-web:latest"
   else
-    if [[ "$ELEMENT_VERSION" =~ ^v ]]; then
-      ELEMENT_TAG="$ELEMENT_VERSION"
+    if [[ "$version_request" =~ ^v ]]; then
+      ELEMENT_TAG="$version_request"
     else
-      ELEMENT_TAG="v${ELEMENT_VERSION}"
+      ELEMENT_TAG="v${version_request}"
     fi
     ELEMENT_ASSET_URL="https://github.com/element-hq/element-web/releases/download/${ELEMENT_TAG}/element-${ELEMENT_TAG}.tar.gz"
+    ELEMENT_VERSION_SOURCE="element-web:${ELEMENT_TAG}"
   fi
 
   [[ -n "${ELEMENT_ASSET_URL:-}" && "${ELEMENT_ASSET_URL}" != "null" ]] || die "Could not resolve Element release asset URL."
+}
+
+resolve_element_tag_from_ess_helm() {
+  local chart_url="$1"
+  python3 - "$chart_url" <<'PY'
+import io
+import re
+import sys
+import tarfile
+import urllib.request
+
+chart_url = sys.argv[1]
+with urllib.request.urlopen(chart_url, timeout=40) as response:
+    content = response.read()
+
+with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as tar:
+    values_member = None
+    for name in tar.getnames():
+        if name.endswith("/values.yaml"):
+            values_member = name
+            break
+
+    if values_member is None:
+        raise SystemExit("Could not find values.yaml in ESS helm chart.")
+
+    values_text = tar.extractfile(values_member).read().decode("utf-8", "ignore")
+
+match = re.search(
+    r"(?ms)^elementWeb:\n(?:^[ \t].*\n)*?^[ \t]{2}image:\n(?:^[ \t].*\n)*?^[ \t]{4}tag:\s*[\"']?([^\"'\n#]+)",
+    values_text,
+)
+
+if not match:
+    raise SystemExit("Could not extract elementWeb.image.tag from ESS values.yaml")
+
+print(match.group(1).strip())
+PY
 }
 
 download_and_install_element() {
@@ -676,6 +735,7 @@ OS: ${PRETTY_NAME}
 
 Element version requested: ${ELEMENT_VERSION}
 Element deployed tag: ${ELEMENT_TAG}
+Element version source: ${ELEMENT_VERSION_SOURCE}
 Element domain: ${ELEMENT_FQDN}
 Element root path: ${ELEMENT_ROOT}
 
