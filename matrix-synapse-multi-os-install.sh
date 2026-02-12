@@ -841,8 +841,9 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
     server_name ${SYNAPSE_FQDN} _;
 
     ssl_certificate ${TLS_CERT_FILE};
@@ -874,8 +875,9 @@ server {
 }
 
 server {
-    listen 8448 ssl http2;
-    listen [::]:8448 ssl http2;
+    listen 8448 ssl;
+    listen [::]:8448 ssl;
+    http2 on;
     server_name ${SYNAPSE_FQDN} _;
 
     ssl_certificate ${TLS_CERT_FILE};
@@ -896,6 +898,25 @@ EOF
   nginx -t
   systemctl enable --now nginx
   systemctl reload nginx
+}
+
+disable_synapse_nginx_configs_if_disabled() {
+  local removed=0
+  local path=""
+  for path in \
+    /etc/nginx/conf.d/matrix-synapse.conf \
+    /etc/nginx/conf.d/matrix-synapse-bootstrap.conf \
+    /etc/nginx/sites-enabled/matrix-synapse \
+    /etc/nginx/sites-available/matrix-synapse; do
+    if [[ -e "$path" ]]; then
+      rm -f "$path"
+      removed=1
+    fi
+  done
+
+  if [[ "$removed" -eq 1 ]]; then
+    log "Removed existing Synapse Nginx config because Synapse Nginx install is disabled."
+  fi
 }
 
 configure_coturn() {
@@ -1161,6 +1182,8 @@ main() {
 
   if [[ "$INSTALL_NGINX" == "true" ]]; then
     configure_nginx
+  else
+    disable_synapse_nginx_configs_if_disabled
   fi
 
   if [[ "$INSTALL_COTURN" == "true" ]]; then

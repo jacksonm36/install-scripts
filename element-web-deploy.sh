@@ -199,6 +199,10 @@ collect_inputs() {
   ELEMENT_FQDN="$(ask_required_text "Element public domain (FQDN)" "$default_host")"
   MATRIX_SERVER_NAME="$(ask_required_text "Matrix server_name (e.g. matrix.example.com)" "$ELEMENT_FQDN")"
   HOMESERVER_URL="$(ask_required_text "Homeserver base URL" "https://${MATRIX_SERVER_NAME}")"
+  if [[ ! "$HOMESERVER_URL" =~ ^https?:// ]]; then
+    warn "Homeserver URL missing scheme, prefixing with https://"
+    HOMESERVER_URL="https://${HOMESERVER_URL}"
+  fi
   HOMESERVER_URL="${HOMESERVER_URL%/}"
 
   ELEMENT_VERSION="$(ask_text "Element version tag (e.g. v1.12.10) or 'latest'" "latest")"
@@ -398,8 +402,9 @@ render_nginx_final_config_tls() {
     federation_block=$(cat <<EOF
 
 server {
-    listen 8448 ssl http2;
-    listen [::]:8448 ssl http2;
+    listen 8448 ssl;
+    listen [::]:8448 ssl;
+    http2 on;
     server_name ${ELEMENT_FQDN};
 
     ssl_certificate ${TLS_CERT_FILE};
@@ -426,8 +431,9 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
     server_name ${ELEMENT_FQDN};
 
     root ${ELEMENT_ROOT};
@@ -465,12 +471,37 @@ $(matrix_proxy_locations)
 EOF
 }
 
+disable_stale_synapse_nginx_configs_if_proxying() {
+  if [[ "$PROXY_MATRIX_ENDPOINTS" != "true" ]]; then
+    return 0
+  fi
+
+  local removed=0
+  local path=""
+  for path in \
+    /etc/nginx/conf.d/matrix-synapse.conf \
+    /etc/nginx/conf.d/matrix-synapse-bootstrap.conf \
+    /etc/nginx/sites-enabled/matrix-synapse \
+    /etc/nginx/sites-available/matrix-synapse; do
+    if [[ -e "$path" ]]; then
+      rm -f "$path"
+      removed=1
+    fi
+  done
+
+  if [[ "$removed" -eq 1 ]]; then
+    log "Removed stale Synapse Nginx config because Element is proxying Matrix endpoints."
+  fi
+}
+
 configure_nginx() {
   log "Configuring Nginx..."
 
   if [[ "$DISABLE_NGINX_DEFAULT" == "true" ]]; then
     rm -f /etc/nginx/conf.d/default.conf /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default
   fi
+
+  disable_stale_synapse_nginx_configs_if_proxying
 
   if [[ "$INSTALL_TLS" == "true" && "$USE_LETSENCRYPT" == "true" ]]; then
     render_nginx_bootstrap_config
