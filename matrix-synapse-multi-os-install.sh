@@ -81,6 +81,27 @@ die() { err "$*"; exit 1; }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+is_valid_ip_or_cidr() {
+  local value="$1"
+  [[ -n "$value" ]] || return 1
+
+  if command_exists python3; then
+    python3 - "$value" <<'PY'
+import ipaddress
+import sys
+
+candidate = sys.argv[1]
+try:
+    ipaddress.ip_network(candidate, strict=False)
+except ValueError:
+    sys.exit(1)
+sys.exit(0)
+PY
+  else
+    [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]
+  fi
+}
+
 gen_alnum() {
   local len="${1:-32}"
   local out=""
@@ -1044,14 +1065,28 @@ EOF
 
 configure_ufw() {
   log "Applying UFW rules..."
-  ufw default deny incoming
+  local ssh_source
+  ssh_source="$(printf '%s' "$SSH_ALLOWED_CIDR" | awk '{$1=$1; print}')"
+  [[ -n "$ssh_source" ]] || ssh_source="any"
+
   ufw default allow outgoing
 
-  if [[ "${SSH_ALLOWED_CIDR,,}" == "any" ]]; then
+  if [[ "${ssh_source,,}" == "any" ]]; then
     ufw allow 22/tcp comment 'SSH'
+  elif is_valid_ip_or_cidr "$ssh_source"; then
+    if ! ufw allow from "$ssh_source" to any port 22 proto tcp comment 'SSH restricted'; then
+      warn "Failed to apply SSH CIDR '${ssh_source}'. Falling back to allow 22/tcp from any source."
+      ufw allow 22/tcp comment 'SSH fallback'
+      ssh_source="any"
+    fi
   else
-    ufw allow from "$SSH_ALLOWED_CIDR" to any port 22 proto tcp comment 'SSH restricted'
+    warn "Invalid SSH source '${ssh_source}'. Falling back to allow 22/tcp from any source."
+    ufw allow 22/tcp comment 'SSH fallback'
+    ssh_source="any"
   fi
+  SSH_ALLOWED_CIDR="$ssh_source"
+
+  ufw default deny incoming
 
   if [[ "$INSTALL_NGINX" == "true" ]]; then
     ufw allow 80/tcp comment 'HTTP'
@@ -1075,13 +1110,25 @@ configure_ufw() {
 configure_firewalld() {
   log "Applying firewalld rules..."
   systemctl enable --now firewalld
+  local ssh_source
+  ssh_source="$(printf '%s' "$SSH_ALLOWED_CIDR" | awk '{$1=$1; print}')"
+  [[ -n "$ssh_source" ]] || ssh_source="any"
 
-  if [[ "${SSH_ALLOWED_CIDR,,}" == "any" ]]; then
+  if [[ "${ssh_source,,}" == "any" ]]; then
     firewall-cmd --permanent --add-service=ssh
-  else
+  elif is_valid_ip_or_cidr "$ssh_source"; then
     firewall-cmd --permanent --remove-service=ssh >/dev/null 2>&1 || true
-    firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${SSH_ALLOWED_CIDR}' port protocol='tcp' port='22' accept"
+    if ! firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${ssh_source}' port protocol='tcp' port='22' accept"; then
+      warn "Failed to apply SSH CIDR '${ssh_source}'. Falling back to SSH service from any source."
+      firewall-cmd --permanent --add-service=ssh
+      ssh_source="any"
+    fi
+  else
+    warn "Invalid SSH source '${ssh_source}'. Falling back to SSH service from any source."
+    firewall-cmd --permanent --add-service=ssh
+    ssh_source="any"
   fi
+  SSH_ALLOWED_CIDR="$ssh_source"
 
   if [[ "$INSTALL_NGINX" == "true" ]]; then
     firewall-cmd --permanent --add-port=80/tcp
