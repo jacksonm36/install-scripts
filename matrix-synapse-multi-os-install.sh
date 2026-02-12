@@ -38,6 +38,7 @@ INSTALL_COTURN="false"
 CONFIGURE_FIREWALL="false"
 INSTALL_FAIL2BAN="false"
 ENABLE_REGISTRATION="false"
+ALLOW_UNVERIFIED_REGISTRATION="false"
 CREATE_ADMIN_USER="false"
 ADMIN_USERNAME=""
 ADMIN_PASSWORD=""
@@ -309,6 +310,8 @@ configure_prompts() {
 
   if ask_yes_no "Enable open user registration?" "n"; then
     ENABLE_REGISTRATION="true"
+    ALLOW_UNVERIFIED_REGISTRATION="true"
+    warn "Open registration selected: installer will set enable_registration_without_verification=true."
   fi
 
   if ask_yes_no "Create an initial Matrix admin user now?" "y"; then
@@ -538,7 +541,7 @@ generate_or_update_synapse_config() {
   fi
 
   export SYNAPSE_CONFIG DB_BACKEND DB_NAME DB_USER DB_PASS INSTALL_NGINX PUBLIC_BASEURL
-  export ENABLE_REGISTRATION REGISTRATION_SHARED_SECRET
+  export ENABLE_REGISTRATION ALLOW_UNVERIFIED_REGISTRATION REGISTRATION_SHARED_SECRET
   export INSTALL_COTURN TURN_HOST TURN_SHARED_SECRET
   export SYNAPSE_LOG_CONFIG="$synapse_log_config"
 
@@ -594,10 +597,14 @@ config["listeners"] = [
 ]
 
 config["public_baseurl"] = os.environ["PUBLIC_BASEURL"]
-config["enable_registration"] = os.environ["ENABLE_REGISTRATION"] == "true"
-config["enable_registration_without_verification"] = False
+enable_registration = os.environ["ENABLE_REGISTRATION"] == "true"
+config["enable_registration"] = enable_registration
+config["enable_registration_without_verification"] = (
+    os.environ["ALLOW_UNVERIFIED_REGISTRATION"] == "true"
+)
 config["registration_shared_secret"] = os.environ["REGISTRATION_SHARED_SECRET"]
 config["report_stats"] = False
+config["suppress_key_server_warning"] = True
 config["pid_file"] = "/run/matrix-synapse/homeserver.pid"
 config["log_config"] = os.environ.get("SYNAPSE_LOG_CONFIG", "/etc/matrix-synapse/log.config")
 
@@ -620,6 +627,12 @@ else:
 with open(config_path, "w", encoding="utf-8") as handle:
     yaml.safe_dump(config, handle, default_flow_style=False, sort_keys=False)
 PY
+
+  if [[ -f "$synapse_log_config" ]]; then
+    sed -i "s|/root/homeserver.log|${SYNAPSE_LOG}/homeserver.log|g" "$synapse_log_config" || true
+    chown "$SYNAPSE_USER:$SYNAPSE_GROUP" "$synapse_log_config" || true
+    chmod 640 "$synapse_log_config" || true
+  fi
 
   chown "$SYNAPSE_USER:$SYNAPSE_GROUP" "$SYNAPSE_CONFIG"
   chmod 640 "$SYNAPSE_CONFIG"
@@ -1028,6 +1041,7 @@ SSH source restriction: ${SSH_ALLOWED_CIDR}
 fail2ban installed: ${INSTALL_FAIL2BAN}
 
 Open registration enabled: ${ENABLE_REGISTRATION}
+Unverified registration allowed: ${ALLOW_UNVERIFIED_REGISTRATION}
 Registration shared secret: ${REGISTRATION_SHARED_SECRET}
 
 Admin user created: ${CREATE_ADMIN_USER}
