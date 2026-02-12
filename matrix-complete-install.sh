@@ -139,7 +139,7 @@ choose_mode_interactive() {
   printf "Choose what to install:\n"
   printf "  1) Synapse only\n"
   printf "  2) Element Web only\n"
-  printf "  3) Full stack (Synapse + Element Web; Synapse Nginx/firewall auto-disabled)\n"
+  printf "  3) Full stack (Synapse + Element Web; Synapse Nginx auto-disabled)\n"
 
   local choice
   while true; do
@@ -263,13 +263,12 @@ run_synapse() {
   fi
 
   if [[ "$MODE" == "full" ]]; then
-    log "Full mode: running Synapse without Nginx/firewall (Element will provide web/proxy layer)."
+    log "Full mode: running Synapse without Nginx (Element will provide web/proxy layer)."
     SYNAPSE_DEFAULT_SERVER_NAME="$MATRIX_DOMAIN" \
     SYNAPSE_DEFAULT_PUBLIC_FQDN="$MATRIX_DOMAIN" \
     SYNAPSE_FORCE_EXTERNAL_REVERSE_PROXY="$EXTERNAL_REVERSE_PROXY" \
     SYNAPSE_FORCE_PUBLIC_BASEURL="$synapse_force_public_baseurl" \
     SYNAPSE_FORCE_INSTALL_NGINX=false \
-    SYNAPSE_FORCE_CONFIGURE_FIREWALL=false \
       bash "$synapse_script"
   elif [[ "$EXTERNAL_REVERSE_PROXY" == "true" ]]; then
     SYNAPSE_DEFAULT_SERVER_NAME="$MATRIX_DOMAIN" \

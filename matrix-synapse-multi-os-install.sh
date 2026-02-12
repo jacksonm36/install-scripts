@@ -376,12 +376,6 @@ configure_prompts() {
     TURN_SHARED_SECRET="$(gen_alnum 48)"
   fi
 
-  local firewall_default
-  firewall_default="y"
-  if [[ "$EXTERNAL_REVERSE_PROXY" == "true" ]]; then
-    firewall_default="n"
-  fi
-
   if [[ -n "$FORCE_CONFIGURE_FIREWALL" ]]; then
     case "${FORCE_CONFIGURE_FIREWALL,,}" in
       1|true|yes|y)
@@ -401,7 +395,7 @@ configure_prompts() {
         die "Invalid SYNAPSE_FORCE_CONFIGURE_FIREWALL value: ${FORCE_CONFIGURE_FIREWALL} (use true/false)"
         ;;
     esac
-  elif ask_yes_no "Configure firewall automatically?" "$firewall_default"; then
+  elif ask_yes_no "Configure firewall automatically?" "y"; then
     CONFIGURE_FIREWALL="true"
     SSH_ALLOWED_CIDR="$(ask_text "Allow SSH from CIDR (or 'any')" "any")"
   fi
