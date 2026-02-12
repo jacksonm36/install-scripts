@@ -84,7 +84,7 @@ choose_mode_interactive() {
   printf "Choose what to install:\n"
   printf "  1) Synapse only\n"
   printf "  2) Element Web only\n"
-  printf "  3) Full stack (Synapse + Element Web)\n"
+  printf "  3) Full stack (Synapse + Element Web; Synapse Nginx/firewall auto-disabled)\n"
 
   local choice
   while true; do
@@ -135,10 +135,10 @@ download_script() {
   local dest="${WORK_DIR}/${name}"
   local url="${RAW_BASE%/}/${name}"
 
-  log "Downloading ${name} from ${url}"
+  log "Downloading ${name} from ${url}" >&2
   curl -fsSL "$url" -o "$dest" || die "Failed to download ${name} from ${url}"
   chmod +x "$dest"
-  printf '%s' "$dest"
+  printf '%s\n' "$dest"
 }
 
 resolve_script() {
@@ -152,7 +152,7 @@ resolve_script() {
   while IFS= read -r path; do
     if [[ -f "$path" ]]; then
       chmod +x "$path" || true
-      printf '%s' "$path"
+      printf '%s\n' "$path"
       return 0
     fi
   done < <(candidate_script_paths "$name")
@@ -171,7 +171,15 @@ run_component() {
 run_synapse() {
   local synapse_script
   synapse_script="$(resolve_script "$SYNAPSE_SCRIPT_NAME")"
-  run_component "Synapse" "$synapse_script"
+  if [[ "$MODE" == "full" ]]; then
+    log "Full mode: running Synapse without Nginx/firewall (Element will provide web/proxy layer)."
+    SYNAPSE_FORCE_INSTALL_NGINX=false \
+    SYNAPSE_FORCE_CONFIGURE_FIREWALL=false \
+      bash "$synapse_script"
+    log "Synapse installer completed."
+  else
+    run_component "Synapse" "$synapse_script"
+  fi
 }
 
 run_element() {

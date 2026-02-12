@@ -51,6 +51,12 @@ TLS_CERT_FILE=""
 TLS_KEY_FILE=""
 MARIADB_MODE_WARNING=""
 
+# Optional automation overrides (used by wrapper/full-stack mode)
+FORCE_INSTALL_NGINX="${SYNAPSE_FORCE_INSTALL_NGINX:-}"
+FORCE_USE_LETSENCRYPT="${SYNAPSE_FORCE_USE_LETSENCRYPT:-}"
+FORCE_CONFIGURE_FIREWALL="${SYNAPSE_FORCE_CONFIGURE_FIREWALL:-}"
+FORCE_SSH_ALLOWED_CIDR="${SYNAPSE_FORCE_SSH_ALLOWED_CIDR:-}"
+
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "[ERROR] Please run this script as root." >&2
   exit 1
@@ -285,10 +291,45 @@ configure_prompts() {
     die "Database user must match: ^[A-Za-z_][A-Za-z0-9_]*$"
   fi
 
-  if ask_yes_no "Install and configure Nginx reverse proxy + TLS?" "y"; then
+  if [[ -n "$FORCE_INSTALL_NGINX" ]]; then
+    case "${FORCE_INSTALL_NGINX,,}" in
+      1|true|yes|y)
+        INSTALL_NGINX="true"
+        log "Nginx install forced by SYNAPSE_FORCE_INSTALL_NGINX=${FORCE_INSTALL_NGINX}"
+        ;;
+      0|false|no|n)
+        INSTALL_NGINX="false"
+        USE_LETSENCRYPT="false"
+        log "Nginx install forced OFF by SYNAPSE_FORCE_INSTALL_NGINX=${FORCE_INSTALL_NGINX}"
+        ;;
+      *)
+        die "Invalid SYNAPSE_FORCE_INSTALL_NGINX value: ${FORCE_INSTALL_NGINX} (use true/false)"
+        ;;
+    esac
+  elif ask_yes_no "Install and configure Nginx reverse proxy + TLS?" "y"; then
     INSTALL_NGINX="true"
-    if ask_yes_no "Use Let's Encrypt certificate (requires working public DNS + port 80)?" "n"; then
+  fi
+
+  if [[ "$INSTALL_NGINX" == "true" ]]; then
+    if [[ -n "$FORCE_USE_LETSENCRYPT" ]]; then
+      case "${FORCE_USE_LETSENCRYPT,,}" in
+        1|true|yes|y)
+          USE_LETSENCRYPT="true"
+          log "Let's Encrypt forced ON by SYNAPSE_FORCE_USE_LETSENCRYPT=${FORCE_USE_LETSENCRYPT}"
+          ;;
+        0|false|no|n)
+          USE_LETSENCRYPT="false"
+          log "Let's Encrypt forced OFF by SYNAPSE_FORCE_USE_LETSENCRYPT=${FORCE_USE_LETSENCRYPT}"
+          ;;
+        *)
+          die "Invalid SYNAPSE_FORCE_USE_LETSENCRYPT value: ${FORCE_USE_LETSENCRYPT} (use true/false)"
+          ;;
+      esac
+    elif ask_yes_no "Use Let's Encrypt certificate (requires working public DNS + port 80)?" "n"; then
       USE_LETSENCRYPT="true"
+    fi
+
+    if [[ "$USE_LETSENCRYPT" == "true" ]]; then
       LETSENCRYPT_EMAIL="$(ask_required_text "Let's Encrypt email" "admin@${SERVER_NAME}")"
     fi
   fi
@@ -299,7 +340,26 @@ configure_prompts() {
     TURN_SHARED_SECRET="$(gen_alnum 48)"
   fi
 
-  if ask_yes_no "Configure firewall automatically?" "y"; then
+  if [[ -n "$FORCE_CONFIGURE_FIREWALL" ]]; then
+    case "${FORCE_CONFIGURE_FIREWALL,,}" in
+      1|true|yes|y)
+        CONFIGURE_FIREWALL="true"
+        if [[ -n "$FORCE_SSH_ALLOWED_CIDR" ]]; then
+          SSH_ALLOWED_CIDR="$FORCE_SSH_ALLOWED_CIDR"
+        else
+          SSH_ALLOWED_CIDR="any"
+        fi
+        log "Firewall config forced ON by SYNAPSE_FORCE_CONFIGURE_FIREWALL=${FORCE_CONFIGURE_FIREWALL}"
+        ;;
+      0|false|no|n)
+        CONFIGURE_FIREWALL="false"
+        log "Firewall config forced OFF by SYNAPSE_FORCE_CONFIGURE_FIREWALL=${FORCE_CONFIGURE_FIREWALL}"
+        ;;
+      *)
+        die "Invalid SYNAPSE_FORCE_CONFIGURE_FIREWALL value: ${FORCE_CONFIGURE_FIREWALL} (use true/false)"
+        ;;
+    esac
+  elif ask_yes_no "Configure firewall automatically?" "y"; then
     CONFIGURE_FIREWALL="true"
     SSH_ALLOWED_CIDR="$(ask_text "Allow SSH from CIDR (or 'any')" "any")"
   fi
@@ -711,8 +771,8 @@ configure_nginx() {
   # Bootstrap HTTP config first (used for ACME challenge and initial startup).
   cat >/etc/nginx/conf.d/matrix-synapse-bootstrap.conf <<EOF
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
+    listen 80;
+    listen [::]:80;
     server_name ${SYNAPSE_FQDN} _;
 
     location ^~ /.well-known/acme-challenge/ {
@@ -757,8 +817,8 @@ EOF
 # Matrix Synapse reverse proxy
 
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
+    listen 80;
+    listen [::]:80;
     server_name ${SYNAPSE_FQDN} _;
 
     location ^~ /.well-known/acme-challenge/ {
@@ -781,8 +841,8 @@ server {
 }
 
 server {
-    listen 443 ssl http2 default_server;
-    listen [::]:443 ssl http2 default_server;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name ${SYNAPSE_FQDN} _;
 
     ssl_certificate ${TLS_CERT_FILE};
@@ -814,8 +874,8 @@ server {
 }
 
 server {
-    listen 8448 ssl http2 default_server;
-    listen [::]:8448 ssl http2 default_server;
+    listen 8448 ssl http2;
+    listen [::]:8448 ssl http2;
     server_name ${SYNAPSE_FQDN} _;
 
     ssl_certificate ${TLS_CERT_FILE};
