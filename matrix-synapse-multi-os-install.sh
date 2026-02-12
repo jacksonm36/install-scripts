@@ -706,13 +706,14 @@ create_self_signed_cert() {
 configure_nginx() {
   log "Configuring Nginx reverse proxy..."
   mkdir -p /etc/nginx/conf.d /var/www/certbot
+  rm -f /etc/nginx/conf.d/default.conf /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default
 
   # Bootstrap HTTP config first (used for ACME challenge and initial startup).
   cat >/etc/nginx/conf.d/matrix-synapse-bootstrap.conf <<EOF
 server {
-    listen 80;
-    listen [::]:80;
-    server_name ${SYNAPSE_FQDN};
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name ${SYNAPSE_FQDN} _;
 
     location ^~ /.well-known/acme-challenge/ {
         root /var/www/certbot;
@@ -756,9 +757,9 @@ EOF
 # Matrix Synapse reverse proxy
 
 server {
-    listen 80;
-    listen [::]:80;
-    server_name ${SYNAPSE_FQDN};
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name ${SYNAPSE_FQDN} _;
 
     location ^~ /.well-known/acme-challenge/ {
         root /var/www/certbot;
@@ -780,9 +781,9 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name ${SYNAPSE_FQDN};
+    listen 443 ssl http2 default_server;
+    listen [::]:443 ssl http2 default_server;
+    server_name ${SYNAPSE_FQDN} _;
 
     ssl_certificate ${TLS_CERT_FILE};
     ssl_certificate_key ${TLS_KEY_FILE};
@@ -813,9 +814,9 @@ server {
 }
 
 server {
-    listen 8448 ssl http2;
-    listen [::]:8448 ssl http2;
-    server_name ${SYNAPSE_FQDN};
+    listen 8448 ssl http2 default_server;
+    listen [::]:8448 ssl http2 default_server;
+    server_name ${SYNAPSE_FQDN} _;
 
     ssl_certificate ${TLS_CERT_FILE};
     ssl_certificate_key ${TLS_KEY_FILE};
