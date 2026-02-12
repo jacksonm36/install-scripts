@@ -293,7 +293,7 @@ download_and_install_element() {
   curl -fL "$ELEMENT_ASSET_URL" -o "$archive"
 
   mkdir -p "$ELEMENT_ROOT"
-  rm -rf "${ELEMENT_ROOT:?}/"*
+  find "$ELEMENT_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
   tar -xzf "$archive" --strip-components=1 -C "$ELEMENT_ROOT"
 
   [[ -f "${ELEMENT_ROOT}/index.html" ]] || die "Element deployment failed: index.html not found."
@@ -526,6 +526,7 @@ configure_nginx() {
 
 configure_ufw() {
   log "Applying UFW rules..."
+  ufw allow 22/tcp comment 'SSH'
   ufw allow 80/tcp comment 'Element HTTP'
   if [[ "$INSTALL_TLS" == "true" ]]; then
     ufw allow 443/tcp comment 'Element HTTPS'
@@ -539,6 +540,7 @@ configure_ufw() {
 configure_firewalld() {
   log "Applying firewalld rules..."
   systemctl enable --now firewalld
+  firewall-cmd --permanent --add-service=ssh
   firewall-cmd --permanent --add-port=80/tcp
   if [[ "$INSTALL_TLS" == "true" ]]; then
     firewall-cmd --permanent --add-port=443/tcp
