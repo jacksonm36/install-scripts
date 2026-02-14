@@ -664,9 +664,9 @@ services:
     healthcheck:
       test: |
         if command -v mongosh >/dev/null 2>&1; then
-          mongosh --quiet -u "\$MONGO_INITDB_ROOT_USERNAME" -p "\$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "db.adminCommand('ping')" || exit 1
+          mongosh --quiet "mongodb://\$MONGO_INITDB_ROOT_USERNAME:\$MONGO_INITDB_ROOT_PASSWORD@localhost:27017/admin" --eval "db.adminCommand('ping')" || exit 1
         else
-          echo 'db.adminCommand("ping")' | mongo -u "\$MONGO_INITDB_ROOT_USERNAME" -p "\$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --quiet || exit 1
+          echo 'db.adminCommand("ping")' | mongo "mongodb://\$MONGO_INITDB_ROOT_USERNAME:\$MONGO_INITDB_ROOT_PASSWORD@localhost:27017/admin" --quiet || exit 1
         fi
       interval: 10s
       timeout: 5s
@@ -885,7 +885,7 @@ EOF
     networks:
       - revolt-network
     healthcheck:
-      test: ["CMD-SHELL", "ps aux | grep -v grep | grep -q '[p]ushd' || exit 1"]
+      test: ["CMD-SHELL", "ps -o comm= -p 1 | grep -q '^pushd$' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -1001,9 +1001,13 @@ configure_nginx() {
   local waited=0
   while [[ "$waited" -lt "$max_wait" ]]; do
     # Check if containers are running and healthy
-    if docker ps --filter "name=revolt-web" --filter "status=running" | grep -q revolt-web && \
-       docker ps --filter "name=revolt-api" --filter "status=running" | grep -q revolt-api; then
-      log "Revolt services are ready"
+    local web_healthy
+    local api_healthy
+    web_healthy=$(docker ps --filter "name=revolt-web" --filter "health=healthy" --format "{{.Names}}" 2>/dev/null || true)
+    api_healthy=$(docker ps --filter "name=revolt-api" --filter "health=healthy" --format "{{.Names}}" 2>/dev/null || true)
+    
+    if [[ -n "$web_healthy" && -n "$api_healthy" ]]; then
+      log "Revolt services are healthy and ready"
       break
     fi
     sleep 5
@@ -1011,7 +1015,7 @@ configure_nginx() {
   done
   
   if [[ "$waited" -ge "$max_wait" ]]; then
-    warn "Revolt services may not be fully ready yet. Nginx will still be configured."
+    warn "Revolt services may not be fully healthy yet. Nginx will still be configured."
   fi
 
   # Bootstrap HTTP config first (used for ACME challenge and initial startup).
