@@ -664,9 +664,9 @@ services:
     healthcheck:
       test: |
         if command -v mongosh >/dev/null 2>&1; then
-          mongosh --quiet --eval "db.adminCommand('ping')" || exit 1
+          mongosh --quiet -u "\$MONGO_INITDB_ROOT_USERNAME" -p "\$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "db.adminCommand('ping')" || exit 1
         else
-          echo 'db.adminCommand("ping")' | mongo --quiet || exit 1
+          echo 'db.adminCommand("ping")' | mongo -u "\$MONGO_INITDB_ROOT_USERNAME" -p "\$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --quiet || exit 1
         fi
       interval: 10s
       timeout: 5s
@@ -885,7 +885,7 @@ EOF
     networks:
       - revolt-network
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f pushd || exit 1"]
+      test: ["CMD-SHELL", "ps aux | grep -v grep | grep -q '[p]ushd' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -995,12 +995,14 @@ configure_nginx() {
   rm -f /etc/nginx/conf.d/default.conf /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default
 
   # Wait for Revolt services to be ready before configuring Nginx
+  # When Nginx is enabled, ports aren't exposed to host, so we check containers directly
   log "Waiting for Revolt services to be ready..."
   local max_wait=120
   local waited=0
   while [[ "$waited" -lt "$max_wait" ]]; do
-    if curl -f http://127.0.0.1:3000/ >/dev/null 2>&1 && \
-       curl -f http://127.0.0.1:8000/ >/dev/null 2>&1; then
+    # Check if containers are running and healthy
+    if docker ps --filter "name=revolt-web" --filter "status=running" | grep -q revolt-web && \
+       docker ps --filter "name=revolt-api" --filter "status=running" | grep -q revolt-api; then
       log "Revolt services are ready"
       break
     fi
