@@ -12,6 +12,7 @@ REPO_REF="${ONESHOTMATRIX_REF:-$DEFAULT_REPO_REF}"
 
 SKIP_SETUP="false"
 FORCE_RECLONE="false"
+PANGOLIN_SSL_OFFLOAD="false"
 OS_FAMILY=""
 PKG_MANAGER=""
 PKG_UPDATED="false"
@@ -36,6 +37,7 @@ Options:
   --install-dir <path>   Install path (default: ${DEFAULT_INSTALL_DIR})
   --repo-url <url>       Git repository URL (default: ${DEFAULT_REPO_URL})
   --repo-ref <ref>       Git ref to deploy (default: ${DEFAULT_REPO_REF})
+  --pangolin-ssl-offload Configure for external TLS proxy (backend on :80)
   --skip-setup           Clone/update + patch only, do not run setup.sh
   --force-reclone        Remove existing install dir before cloning
   -h, --help             Show this help
@@ -64,6 +66,10 @@ parse_args() {
         [[ $# -ge 2 ]] || die "--repo-ref requires a value"
         REPO_REF="$2"
         shift 2
+        ;;
+      --pangolin-ssl-offload)
+        PANGOLIN_SSL_OFFLOAD="true"
+        shift
         ;;
       --skip-setup)
         SKIP_SETUP="true"
@@ -389,6 +395,239 @@ PY
   bash -n "$INSTALL_DIR/setup.sh" || die "Patched setup.sh failed syntax validation."
 }
 
+apply_pangolin_offload_patches() {
+  log "Applying Pangolin SSL offload patches..."
+
+  local setup_file="$INSTALL_DIR/setup.sh"
+  local compose_file="$INSTALL_DIR/docker-compose.yml"
+  local matrix_template="$INSTALL_DIR/templates/matrix.conf.template"
+
+  [[ -f "$setup_file" ]] || die "setup.sh not found at ${setup_file}"
+  [[ -f "$compose_file" ]] || die "docker-compose.yml not found at ${compose_file}"
+  [[ -f "$matrix_template" ]] || die "matrix.conf template not found at ${matrix_template}"
+
+  # 1) Patch setup flow: skip certbot, generate local self-signed cert, and avoid local 443/8448 firewall rules.
+  python3 - "$setup_file" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+changes = []
+
+certbot_block_replacement = '''step "Preparing TLS assets (Let's Encrypt or proxy-offload mode)..."
+
+if [ "${PANGOLIN_SSL_OFFLOAD:-false}" = "true" ]; then
+    echo -e "  ${YELLOW}Pangolin SSL offload enabled: skipping certbot and generating a local self-signed cert for internal services.${NC}"
+    CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
+    mkdir -p "$CERT_DIR"
+    if [ ! -f "$CERT_DIR/fullchain.pem" ] || [ ! -f "$CERT_DIR/privkey.pem" ]; then
+        if ! openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
+            -keyout "$CERT_DIR/privkey.pem" \
+            -out "$CERT_DIR/fullchain.pem" \
+            -subj "/CN=${DOMAIN}" \
+            -addext "subjectAltName=DNS:${DOMAIN}" >/dev/null 2>&1; then
+            fail "Failed to generate local self-signed certificate."
+        fi
+        chmod 600 "$CERT_DIR/privkey.pem"
+        chmod 644 "$CERT_DIR/fullchain.pem"
+    fi
+else
+    # Stop anything on port 80
+    systemctl stop nginx 2>/dev/null || true
+    docker compose -f "$INSTALL_DIR/docker-compose.yml" down 2>/dev/null || true
+
+    certbot certonly \
+        --standalone \
+        --non-interactive \
+        --agree-tos \
+        --email "$ACME_EMAIL" \
+        -d "$DOMAIN" \
+        --preferred-challenges http \
+        2>/dev/null
+
+    if [ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]; then
+        echo ""
+        echo -e "${RED}SSL certificate failed. This usually means one of:${NC}"
+        echo "  1. Your domain ($DOMAIN) doesn't point to this server's IP yet"
+        echo "  2. DNS changes haven't propagated (can take up to 24 hours)"
+        echo "  3. Port 80 is blocked (check your firewall/VPS provider)"
+        echo ""
+        echo "Fix the issue and re-run this installer — it will pick up where it left off."
+        exit 1
+    fi
+
+    # Patch certbot renewal config to use webroot (standalone only works when nginx is down)
+    RENEWAL_CONF="/etc/letsencrypt/renewal/${DOMAIN}.conf"
+    if [ -f "$RENEWAL_CONF" ]; then
+        sed -i "s|authenticator = standalone|authenticator = webroot|" "$RENEWAL_CONF"
+        if ! grep -q "webroot_path" "$RENEWAL_CONF"; then
+            sed -i "/\\[renewalparams\\]/a webroot_path = $DATA_DIR/certbot/www" "$RENEWAL_CONF"
+        fi
+        # Add webroot map section if missing
+        if ! grep -q "\\[\\[webroot\\]\\]" "$RENEWAL_CONF"; then
+            printf '\\n[[webroot]]\\n%s = %s\\n' "$DOMAIN" "$DATA_DIR/certbot/www" >> "$RENEWAL_CONF"
+        fi
+    fi
+fi
+
+ok'''
+
+start_marker = "step \"Getting SSL certificate (HTTPS) from Let's Encrypt...\""
+end_marker = '# ─── [7/11] Configure firewall'
+start_index = text.find(start_marker)
+if start_index != -1:
+    end_index = text.find(end_marker, start_index)
+    if end_index != -1:
+        text = text[:start_index] + certbot_block_replacement.rstrip() + "\n\n" + text[end_index:]
+        changes.append("certbot step made offload-aware")
+
+firewall_block_old = '''# Preserve SSH access before enabling firewall
+SSH_PORT=$(detect_ssh_port)
+fw_allow "${SSH_PORT}/tcp"
+fw_allow 80/tcp
+fw_allow 443/tcp
+fw_allow 8448/tcp
+fw_allow 3478/tcp
+fw_allow 3478/udp
+fw_allow 5349/tcp
+fw_allow 5349/udp
+fw_allow 49152:49200/udp
+fw_enable'''
+
+firewall_block_new = '''# Preserve SSH access before enabling firewall
+SSH_PORT=$(detect_ssh_port)
+fw_allow "${SSH_PORT}/tcp"
+fw_allow 80/tcp
+if [ "${PANGOLIN_SSL_OFFLOAD:-false}" = "true" ]; then
+    echo -e "  ${YELLOW}Pangolin SSL offload mode: skipping local 443/8448 firewall rules.${NC}"
+else
+    fw_allow 443/tcp
+    fw_allow 8448/tcp
+fi
+fw_allow 3478/tcp
+fw_allow 3478/udp
+fw_allow 5349/tcp
+fw_allow 5349/udp
+fw_allow 49152:49200/udp
+fw_enable'''
+
+if firewall_block_old in text:
+    text = text.replace(firewall_block_old, firewall_block_new, 1)
+    changes.append("firewall step adapted for offload mode")
+
+cron_block_old = '''# Certbot cron for renewal (webroot mode using nginx)
+# Add cert renewal cron if not already present
+CRON_LINE="0 3 * * * certbot renew --deploy-hook 'cd $INSTALL_DIR && docker compose exec -T nginx nginx -s reload && docker compose restart coturn' # matrix-discord-killer"
+(crontab -l 2>/dev/null | grep -v "# matrix-discord-killer" || true; echo "$CRON_LINE") | crontab -'''
+
+cron_block_new = '''if [ "${PANGOLIN_SSL_OFFLOAD:-false}" != "true" ]; then
+    # Certbot cron for renewal (webroot mode using nginx)
+    # Add cert renewal cron if not already present
+    CRON_LINE="0 3 * * * certbot renew --deploy-hook 'cd $INSTALL_DIR && docker compose exec -T nginx nginx -s reload && docker compose restart coturn' # matrix-discord-killer"
+    (crontab -l 2>/dev/null | grep -v "# matrix-discord-killer" || true; echo "$CRON_LINE") | crontab -
+fi'''
+
+if cron_block_old in text:
+    text = text.replace(cron_block_old, cron_block_new, 1)
+    changes.append("certbot renewal cron disabled in offload mode")
+
+path.write_text(text, encoding="utf-8")
+print("Pangolin setup.sh patches:")
+if changes:
+    for item in changes:
+        print(f" - {item}")
+else:
+    print(" - none (upstream layout changed)")
+PY
+
+  # 2) Use HTTP-only matrix nginx template (proxy backend :80, no 80->443 redirect loop).
+  cat >"$matrix_template" <<'EOF'
+# Pangolin SSL offload mode: serve Matrix/Element on plain HTTP internally.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __DOMAIN__;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location /.well-known/matrix/server {
+        default_type application/json;
+        add_header Access-Control-Allow-Origin * always;
+        return 200 '{"m.server": "__DOMAIN__:443"}';
+    }
+
+    location /.well-known/matrix/client {
+        default_type application/json;
+        add_header Access-Control-Allow-Origin * always;
+        add_header Access-Control-Allow-Methods "GET, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "Origin, X-Requested-With, Content-Type, Accept, Authorization" always;
+        return 200 '{"m.homeserver": {"base_url": "https://__DOMAIN__"}}';
+    }
+
+    location ~ ^/_matrix/client/(r0|v3|unstable)/login$ {
+        limit_req zone=matrix_login burst=3 nodelay;
+        proxy_pass http://synapse:8008;
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Host $host;
+    }
+
+    location /_matrix/ {
+        limit_req zone=matrix_general burst=50 nodelay;
+        proxy_pass http://synapse:8008;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Host $host;
+        proxy_read_timeout 600s;
+    }
+
+    location /_synapse/ {
+        limit_req zone=matrix_general burst=50 nodelay;
+        proxy_pass http://synapse:8008;
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Host $host;
+    }
+
+    location / {
+        proxy_pass http://element:80;
+        proxy_set_header Host $host;
+    }
+}
+EOF
+
+  # 3) Expose only backend HTTP when SSL is terminated by Pangolin.
+  python3 - "$compose_file" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old = '''    ports:
+      - "80:80"
+      - "443:443"
+      - "8448:8448"
+'''
+new = '''    ports:
+      - "80:80"
+'''
+if old in text:
+    text = text.replace(old, new, 1)
+path.write_text(text, encoding="utf-8")
+print("Pangolin docker-compose patch applied.")
+PY
+
+  bash -n "$setup_file" || die "Pangolin-patched setup.sh failed syntax validation."
+}
+
 preopen_acme_firewall_paths() {
   local ssh_port
   ssh_port="$(detect_ssh_port_safe)"
@@ -423,6 +662,9 @@ main() {
 
   clone_or_update_repo
   apply_setup_hotfixes
+  if [[ "$PANGOLIN_SSL_OFFLOAD" == "true" ]]; then
+    apply_pangolin_offload_patches
+  fi
 
   if [[ "$SKIP_SETUP" == "true" ]]; then
     log "Setup execution skipped (--skip-setup)."
@@ -433,7 +675,7 @@ main() {
 
   [[ -e /dev/tty ]] || die "/dev/tty not available. Run from an interactive terminal."
   log "Starting patched oneshotmatrix setup..."
-  exec "$INSTALL_DIR/setup.sh" </dev/tty
+  PANGOLIN_SSL_OFFLOAD="$PANGOLIN_SSL_OFFLOAD" exec "$INSTALL_DIR/setup.sh" </dev/tty
 }
 
 main "$@"
