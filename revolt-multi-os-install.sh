@@ -885,7 +885,7 @@ EOF
     networks:
       - revolt-network
     healthcheck:
-      test: ["CMD-SHELL", "ps -o comm= -p 1 | grep -q '^pushd$' || exit 1"]
+      test: ["CMD-SHELL", "pgrep -x pushd >/dev/null || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
