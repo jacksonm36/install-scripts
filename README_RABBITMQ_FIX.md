@@ -68,6 +68,7 @@ docker compose up -d
 | **QUICK_FIX_GUIDE.md** | Immediate solutions for active issues |
 | **REVOLT_RABBITMQ_FIX.md** | Complete documentation and troubleshooting |
 | **revolt-rabbitmq-credentials-fix.sh** | Automated fix script |
+| **test-rabbitmq-connection.sh** | Diagnostic and verification test suite |
 | **docker-compose-rabbitmq-example.yml** | Example configuration to prevent issues |
 | **README_RABBITMQ_FIX.md** | This file - overview and quick start |
 
@@ -75,10 +76,11 @@ docker compose up -d
 
 ```
 📁 RabbitMQ Fix Solution
-├── 📄 README_RABBITMQ_FIX.md          ← Start here
-├── 📄 QUICK_FIX_GUIDE.md              ← Need immediate fix?
-├── 📄 REVOLT_RABBITMQ_FIX.md          ← Detailed documentation
+├── 📄 README_RABBITMQ_FIX.md              ← Start here
+├── 📄 QUICK_FIX_GUIDE.md                  ← Need immediate fix?
+├── 📄 REVOLT_RABBITMQ_FIX.md              ← Detailed documentation
 ├── 🔧 revolt-rabbitmq-credentials-fix.sh  ← Automated fix
+├── 🧪 test-rabbitmq-connection.sh         ← Verify & diagnose
 └── 📋 docker-compose-rabbitmq-example.yml ← Reference configuration
 ```
 
@@ -134,6 +136,22 @@ See: [REVOLT_RABBITMQ_FIX.md](REVOLT_RABBITMQ_FIX.md) - Security Recommendations
 ## Verification Steps
 
 After applying any fix, verify success:
+
+### Automated Verification (Recommended)
+
+```bash
+# Run comprehensive test suite
+./test-rabbitmq-connection.sh /path/to/your/deployment
+
+# This will check:
+# - Container status and health
+# - User existence and permissions
+# - Environment configuration
+# - Service connectivity
+# - Recent error logs
+```
+
+### Manual Verification
 
 ```bash
 # 1. Check container status

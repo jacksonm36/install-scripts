@@ -46,6 +46,13 @@ docker compose restart api pushd events
 
 ### Verify Fix
 
+**Option A: Automated Test (Recommended)**
+```bash
+# Run comprehensive test suite
+./test-rabbitmq-connection.sh /opt/matrix-discord-killer
+```
+
+**Option B: Manual Verification**
 ```bash
 # Check that services are now running (not restarting)
 docker ps
