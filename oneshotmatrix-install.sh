@@ -195,10 +195,23 @@ detect_ssh_port_safe() {
   printf '%s\n' "${port:-22}"
 }
 
+is_directory_empty() {
+  local dir="$1"
+  local entries=()
+  shopt -s nullglob dotglob
+  entries=("${dir}"/*)
+  shopt -u nullglob dotglob
+  [[ "${#entries[@]}" -eq 0 ]]
+}
+
 clone_or_update_repo() {
   if [[ "$FORCE_RECLONE" == "true" && -d "$INSTALL_DIR" ]]; then
     log "Removing existing install directory due to --force-reclone."
     rm -rf "$INSTALL_DIR"
+  fi
+
+  if [[ -e "$INSTALL_DIR" && ! -d "$INSTALL_DIR" ]]; then
+    die "Install path exists and is not a directory: ${INSTALL_DIR}"
   fi
 
   if [[ -d "$INSTALL_DIR/.git" ]]; then
@@ -212,6 +225,19 @@ clone_or_update_repo() {
     else
       warn "Fetch failed, re-cloning repository."
       rm -rf "$INSTALL_DIR"
+    fi
+  fi
+
+  if [[ -d "$INSTALL_DIR" && ! -d "$INSTALL_DIR/.git" ]]; then
+    if is_directory_empty "$INSTALL_DIR"; then
+      log "Removing empty existing directory at ${INSTALL_DIR} before clone."
+      rmdir "$INSTALL_DIR"
+    else
+      local backup_dir
+      backup_dir="${INSTALL_DIR}.backup.$(date +%Y%m%d%H%M%S)"
+      warn "Non-git directory exists at ${INSTALL_DIR}; moving it to ${backup_dir}"
+      mv "$INSTALL_DIR" "$backup_dir" \
+        || die "Failed to move existing directory. Use --force-reclone to remove it."
     fi
   fi
 
