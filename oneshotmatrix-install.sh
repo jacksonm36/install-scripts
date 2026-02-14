@@ -361,6 +361,65 @@ replace_once(
 "stoat readiness probe without container curl dependency",
 )
 
+# Add RabbitMQ credential configuration after stoat services start
+replace_once(
+"""    echo ""
+    echo "🎉 Installation complete!"
+    echo ""
+    echo "Matrix (Synapse) is running at https://$PUBLIC_DOMAIN"
+    echo "Element Web interface is running at https://web.$PUBLIC_DOMAIN"
+    echo "Revolt (Stoat) is running at https://$STOAT_DOMAIN"
+    echo ""
+    echo "Important: Access $INSTALL_DIR/.env for credentials and configuration."
+    echo ""
+}
+""",
+"""    echo ""
+    echo "🔧 Configuring RabbitMQ credentials..."
+    
+    # Configure RabbitMQ with credentials from .env
+    if [ -f "$INSTALL_DIR/.env" ]; then
+        RABBIT_USER=$(grep "^RABBIT_USER=" "$INSTALL_DIR/.env" | cut -d= -f2- | tr -d '"' | tr -d "'" || echo "rabbituser")
+        RABBIT_PASSWORD=$(grep "^RABBIT_PASSWORD=" "$INSTALL_DIR/.env" | cut -d= -f2- | tr -d '"' | tr -d "'" || echo "")
+        
+        if [ -n "$RABBIT_PASSWORD" ]; then
+            # Wait for RabbitMQ to be ready
+            echo "Waiting for RabbitMQ to be ready..."
+            for i in {1..30}; do
+                if docker compose exec -T rabbit rabbitmqctl status >/dev/null 2>&1; then
+                    break
+                fi
+                sleep 1
+            done
+            
+            # Delete user if exists, then recreate
+            docker compose exec -T rabbit rabbitmqctl delete_user "$RABBIT_USER" 2>/dev/null || true
+            docker compose exec -T rabbit rabbitmqctl add_user "$RABBIT_USER" "$RABBIT_PASSWORD" 2>/dev/null || true
+            docker compose exec -T rabbit rabbitmqctl set_user_tags "$RABBIT_USER" administrator 2>/dev/null || true
+            docker compose exec -T rabbit rabbitmqctl set_permissions -p / "$RABBIT_USER" ".*" ".*" ".*" 2>/dev/null || true
+            
+            echo "✓ RabbitMQ credentials configured"
+            
+            # Restart services that depend on RabbitMQ
+            echo "Restarting Revolt services..."
+            docker compose restart api pushd events >/dev/null 2>&1 || true
+        fi
+    fi
+    
+    echo ""
+    echo "🎉 Installation complete!"
+    echo ""
+    echo "Matrix (Synapse) is running at https://$PUBLIC_DOMAIN"
+    echo "Element Web interface is running at https://web.$PUBLIC_DOMAIN"
+    echo "Revolt (Stoat) is running at https://$STOAT_DOMAIN"
+    echo ""
+    echo "Important: Access $INSTALL_DIR/.env for credentials and configuration."
+    echo ""
+}
+""",
+"RabbitMQ credential configuration at setup completion",
+)
+
 setup_path.write_text(text, encoding="utf-8")
 print("Applied hotfixes:")
 if changes:
