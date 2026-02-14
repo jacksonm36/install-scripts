@@ -5,6 +5,8 @@ SCRIPT_VERSION="1.0.0"
 DEFAULT_REPO_URL="https://github.com/loponai/oneshotmatrix.git"
 DEFAULT_INSTALL_DIR="/opt/matrix-discord-killer"
 DEFAULT_REPO_REF="main"
+DEFAULT_PANGOLIN_BACKEND_PORT="18080"
+DEFAULT_PANGOLIN_BACKEND_BIND="127.0.0.1"
 
 REPO_URL="${ONESHOTMATRIX_REPO_URL:-$DEFAULT_REPO_URL}"
 INSTALL_DIR="${ONESHOTMATRIX_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
@@ -13,6 +15,8 @@ REPO_REF="${ONESHOTMATRIX_REF:-$DEFAULT_REPO_REF}"
 SKIP_SETUP="false"
 FORCE_RECLONE="false"
 PANGOLIN_SSL_OFFLOAD="false"
+PANGOLIN_BACKEND_PORT="${PANGOLIN_BACKEND_PORT:-$DEFAULT_PANGOLIN_BACKEND_PORT}"
+PANGOLIN_BACKEND_BIND="${PANGOLIN_BACKEND_BIND:-$DEFAULT_PANGOLIN_BACKEND_BIND}"
 OS_FAMILY=""
 PKG_MANAGER=""
 PKG_UPDATED="false"
@@ -37,7 +41,11 @@ Options:
   --install-dir <path>   Install path (default: ${DEFAULT_INSTALL_DIR})
   --repo-url <url>       Git repository URL (default: ${DEFAULT_REPO_URL})
   --repo-ref <ref>       Git ref to deploy (default: ${DEFAULT_REPO_REF})
-  --pangolin-ssl-offload Configure for external TLS proxy (backend on :80)
+  --pangolin-ssl-offload Configure for external TLS proxy
+  --pangolin-backend-port <port>
+                         Backend port exposed for Pangolin (default: ${DEFAULT_PANGOLIN_BACKEND_PORT})
+  --pangolin-backend-bind <ip>
+                         Backend bind address (default: ${DEFAULT_PANGOLIN_BACKEND_BIND})
   --skip-setup           Clone/update + patch only, do not run setup.sh
   --force-reclone        Remove existing install dir before cloning
   -h, --help             Show this help
@@ -46,6 +54,8 @@ Environment overrides:
   ONESHOTMATRIX_INSTALL_DIR
   ONESHOTMATRIX_REPO_URL
   ONESHOTMATRIX_REF
+  PANGOLIN_BACKEND_PORT
+  PANGOLIN_BACKEND_BIND
 EOF
 }
 
@@ -71,6 +81,16 @@ parse_args() {
         PANGOLIN_SSL_OFFLOAD="true"
         shift
         ;;
+      --pangolin-backend-port)
+        [[ $# -ge 2 ]] || die "--pangolin-backend-port requires a value"
+        PANGOLIN_BACKEND_PORT="$2"
+        shift 2
+        ;;
+      --pangolin-backend-bind)
+        [[ $# -ge 2 ]] || die "--pangolin-backend-bind requires a value"
+        PANGOLIN_BACKEND_BIND="$2"
+        shift 2
+        ;;
       --skip-setup)
         SKIP_SETUP="true"
         shift
@@ -88,6 +108,13 @@ parse_args() {
         ;;
     esac
   done
+}
+
+validate_pangolin_backend_settings() {
+  [[ "$PANGOLIN_BACKEND_PORT" =~ ^[0-9]+$ ]] || die "Invalid --pangolin-backend-port: ${PANGOLIN_BACKEND_PORT}"
+  (( PANGOLIN_BACKEND_PORT >= 1 && PANGOLIN_BACKEND_PORT <= 65535 )) \
+    || die "--pangolin-backend-port must be between 1 and 65535."
+  [[ -n "$PANGOLIN_BACKEND_BIND" ]] || die "--pangolin-backend-bind cannot be empty."
 }
 
 require_root() {
@@ -521,6 +548,9 @@ apply_pangolin_offload_patches() {
   local matrix_template="$INSTALL_DIR/templates/matrix.conf.template"
   local stoat_env_template="$INSTALL_DIR/templates/stoat-env.web.template"
   local caddy_template="$INSTALL_DIR/templates/Caddyfile.template"
+  local backend_binding
+
+  backend_binding="${PANGOLIN_BACKEND_BIND}:${PANGOLIN_BACKEND_PORT}:80"
 
   [[ -f "$setup_file" ]] || die "setup.sh not found at ${setup_file}"
   [[ -f "$compose_file" ]] || die "docker-compose.yml not found at ${compose_file}"
@@ -621,10 +651,15 @@ fw_enable'''
 firewall_block_new = '''# Preserve SSH access before enabling firewall
 SSH_PORT=$(detect_ssh_port)
 fw_allow "${SSH_PORT}/tcp"
-fw_allow 80/tcp
 if [ "${PANGOLIN_SSL_OFFLOAD:-false}" = "true" ]; then
-    echo -e "  ${YELLOW}Pangolin SSL offload mode: skipping local 443/8448 firewall rules.${NC}"
+    if [ "${PANGOLIN_BACKEND_BIND:-127.0.0.1}" = "127.0.0.1" ]; then
+        echo -e "  ${YELLOW}Pangolin SSL offload mode: backend bound to localhost, skipping HTTP/HTTPS/federation firewall rules.${NC}"
+    else
+        fw_allow "${PANGOLIN_BACKEND_PORT:-18080}/tcp"
+        echo -e "  ${YELLOW}Pangolin SSL offload mode: opened backend port ${PANGOLIN_BACKEND_PORT:-18080}/tcp only.${NC}"
+    fi
 else
+    fw_allow 80/tcp
     fw_allow 443/tcp
     fw_allow 8448/tcp
 fi
@@ -647,10 +682,15 @@ fw_enable'''
 
 stoat_firewall_new = '''SSH_PORT=$(detect_ssh_port)
 fw_allow "${SSH_PORT}/tcp"
-fw_allow 80/tcp
 if [ "${PANGOLIN_SSL_OFFLOAD:-false}" = "true" ]; then
-    echo -e "  ${YELLOW}Pangolin SSL offload mode: skipping local 443 firewall rule.${NC}"
+    if [ "${PANGOLIN_BACKEND_BIND:-127.0.0.1}" = "127.0.0.1" ]; then
+        echo -e "  ${YELLOW}Pangolin SSL offload mode: backend bound to localhost, skipping HTTP/HTTPS firewall rules.${NC}"
+    else
+        fw_allow "${PANGOLIN_BACKEND_PORT:-18080}/tcp"
+        echo -e "  ${YELLOW}Pangolin SSL offload mode: opened backend port ${PANGOLIN_BACKEND_PORT:-18080}/tcp only.${NC}"
+    fi
 else
+    fw_allow 80/tcp
     fw_allow 443/tcp
 fi
 fw_enable'''
@@ -747,20 +787,21 @@ server {
 }
 EOF
 
-  # 3) Expose only backend HTTP for Matrix when SSL is terminated by Pangolin.
-  python3 - "$compose_file" <<'PY'
+  # 3) Expose backend on a configurable Pangolin-facing port.
+  python3 - "$compose_file" "$backend_binding" <<'PY'
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
+binding = sys.argv[2]
 text = path.read_text(encoding="utf-8")
 old = '''    ports:
       - "80:80"
       - "443:443"
       - "8448:8448"
 '''
-new = '''    ports:
-      - "80:80"
+new = f'''    ports:
+      - "{binding}"
 '''
 if old in text:
     text = text.replace(old, new, 1)
@@ -822,18 +863,19 @@ http://{$HOSTNAME} {
 }
 EOF
 
-  python3 - "$stoat_compose_file" <<'PY'
+  python3 - "$stoat_compose_file" "$backend_binding" <<'PY'
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
+binding = sys.argv[2]
 text = path.read_text(encoding="utf-8")
 old = '''    ports:
       - "80:80"
       - "443:443"
 '''
-new = '''    ports:
-      - "80:80"
+new = f'''    ports:
+      - "{binding}"
 '''
 if old in text:
     text = text.replace(old, new, 1)
@@ -847,6 +889,29 @@ PY
 preopen_acme_firewall_paths() {
   local ssh_port
   ssh_port="$(detect_ssh_port_safe)"
+
+  if [[ "$PANGOLIN_SSL_OFFLOAD" == "true" ]]; then
+    if [[ "$PANGOLIN_BACKEND_BIND" == "127.0.0.1" ]]; then
+      log "Pangolin offload mode with localhost backend; skipping pre-open firewall ports."
+      return 0
+    fi
+
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+      if command_exists ufw && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+        log "Pre-opening SSH (${ssh_port}) and backend port ${PANGOLIN_BACKEND_PORT}/tcp in active UFW."
+        ufw allow "${ssh_port}/tcp" >/dev/null 2>&1 || true
+        ufw allow "${PANGOLIN_BACKEND_PORT}/tcp" >/dev/null 2>&1 || true
+      fi
+    else
+      if command_exists firewall-cmd && systemctl is-active --quiet firewalld; then
+        log "Pre-opening SSH (${ssh_port}) and backend port ${PANGOLIN_BACKEND_PORT}/tcp in active firewalld."
+        firewall-cmd --permanent --zone=public --add-port="${ssh_port}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --permanent --zone=public --add-port="${PANGOLIN_BACKEND_PORT}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+      fi
+    fi
+    return 0
+  fi
 
   if [[ "$OS_FAMILY" == "debian" ]]; then
     if command_exists ufw && ufw status 2>/dev/null | grep -qi 'Status: active'; then
@@ -868,6 +933,7 @@ preopen_acme_firewall_paths() {
 
 main() {
   parse_args "$@"
+  validate_pangolin_backend_settings
   require_root
   detect_os
 
@@ -891,7 +957,10 @@ main() {
 
   [[ -e /dev/tty ]] || die "/dev/tty not available. Run from an interactive terminal."
   log "Starting patched oneshotmatrix setup..."
-  PANGOLIN_SSL_OFFLOAD="$PANGOLIN_SSL_OFFLOAD" exec "$INSTALL_DIR/setup.sh" </dev/tty
+  PANGOLIN_SSL_OFFLOAD="$PANGOLIN_SSL_OFFLOAD" \
+  PANGOLIN_BACKEND_PORT="$PANGOLIN_BACKEND_PORT" \
+  PANGOLIN_BACKEND_BIND="$PANGOLIN_BACKEND_BIND" \
+    exec "$INSTALL_DIR/setup.sh" </dev/tty
 }
 
 main "$@"
