@@ -361,6 +361,52 @@ replace_once(
 "stoat readiness probe without container curl dependency",
 )
 
+replace_once(
+"""COMPOSE_EXIT=0
+docker compose up -d 2>&1 || COMPOSE_EXIT=$?
+if [ "$COMPOSE_EXIT" -ne 0 ]; then
+    fail "Docker failed to start. Run 'cd $INSTALL_DIR && docker compose logs' to see what went wrong."
+fi
+
+ok
+""",
+"""COMPOSE_EXIT=0
+docker compose up -d 2>&1 || COMPOSE_EXIT=$?
+if [ "$COMPOSE_EXIT" -ne 0 ]; then
+    fail "Docker failed to start. Run 'cd $INSTALL_DIR && docker compose logs' to see what went wrong."
+fi
+
+# Keep RabbitMQ credentials in sync with .env.
+# RabbitMQ ignores RABBITMQ_DEFAULT_* when reusing an existing data volume,
+# which can lead to "invalid credentials" crash loops on api/pushd after reruns.
+echo -n "  Syncing RabbitMQ credentials..."
+RABBIT_READY="false"
+for i in $(seq 1 30); do
+    if docker compose exec -T rabbit rabbitmq-diagnostics -q ping >/dev/null 2>&1; then
+        RABBIT_READY="true"
+        break
+    fi
+    sleep 2
+done
+
+if [ "$RABBIT_READY" != "true" ]; then
+    echo ""
+    echo -e "${RED}RabbitMQ did not become ready.${NC}"
+    echo "Run 'cd $INSTALL_DIR && docker compose logs rabbit' to see the error."
+    exit 1
+fi
+
+docker compose exec -T rabbit rabbitmqctl add_user "$RABBIT_USER" "$RABBIT_PASSWORD" >/dev/null 2>&1 || true
+docker compose exec -T rabbit rabbitmqctl change_password "$RABBIT_USER" "$RABBIT_PASSWORD" >/dev/null 2>&1 || true
+docker compose exec -T rabbit rabbitmqctl set_permissions -p / "$RABBIT_USER" ".*" ".*" ".*" >/dev/null 2>&1 || true
+docker compose restart api pushd >/dev/null 2>&1 || true
+echo " done"
+
+ok
+""",
+"sync RabbitMQ credentials to avoid invalid credentials loop",
+)
+
 setup_path.write_text(text, encoding="utf-8")
 print("Applied hotfixes:")
 if changes:
