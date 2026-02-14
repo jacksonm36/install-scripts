@@ -1,0 +1,206 @@
+# Example Docker Compose configuration for RabbitMQ with Revolt
+# This configuration prevents the "invalid credentials" error by properly
+# setting up RabbitMQ authentication from the start.
+#
+# Usage:
+# 1. Copy the relevant sections to your docker-compose.yml
+# 2. Create a .env file with the credentials
+# 3. Ensure all services use the same credentials
+
+version: '3.8'
+
+services:
+  # RabbitMQ Service with proper credential configuration
+  rabbit:
+    image: rabbitmq:4
+    container_name: revolt-rabbit
+    restart: unless-stopped
+    
+    # IMPORTANT: Configure default user on first start
+    environment:
+      # These create the user when RabbitMQ first initializes
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME:-rabbituser}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-rabbitpass}
+      
+      # Optional: Enable management plugin for web UI
+      # RABBITMQ_MANAGEMENT_ENABLED: "true"
+    
+    # Optional: Persist RabbitMQ data
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    
+    # Internal port only - no need to expose publicly
+    # ports:
+    #   - "5672:5672"    # AMQP port (only if needed externally)
+    #   - "15672:15672"  # Management UI (only if RABBITMQ_MANAGEMENT_ENABLED)
+    
+    networks:
+      - revolt-network
+    
+    # Health check to ensure RabbitMQ is ready
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # API Service (revolt-delta) - properly configured for RabbitMQ
+  api:
+    image: ghcr.io/stoatchat/api:v0.11.0
+    container_name: revolt-api
+    restart: unless-stopped
+    
+    # Load environment variables from .env file
+    env_file:
+      - .env
+    
+    # Explicitly set RabbitMQ connection
+    environment:
+      RABBITMQ_URI: ${RABBITMQ_URI:-amqp://rabbituser:rabbitpass@rabbit:5672/}
+      # Alternative if your app uses separate variables:
+      # RABBITMQ_HOST: rabbit
+      # RABBITMQ_PORT: 5672
+      # RABBITMQ_USERNAME: ${RABBITMQ_USERNAME:-rabbituser}
+      # RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-rabbitpass}
+    
+    depends_on:
+      rabbit:
+        condition: service_healthy
+      database:
+        condition: service_healthy
+    
+    networks:
+      - revolt-network
+
+  # Push Daemon Service - properly configured for RabbitMQ
+  pushd:
+    image: ghcr.io/stoatchat/pushd:v0.11.0
+    container_name: revolt-pushd
+    restart: unless-stopped
+    
+    env_file:
+      - .env
+    
+    environment:
+      RABBITMQ_URI: ${RABBITMQ_URI:-amqp://rabbituser:rabbitpass@rabbit:5672/}
+    
+    depends_on:
+      rabbit:
+        condition: service_healthy
+    
+    networks:
+      - revolt-network
+
+  # Events Service - properly configured for RabbitMQ
+  events:
+    image: ghcr.io/stoatchat/events:v0.11.0
+    container_name: revolt-events
+    restart: unless-stopped
+    
+    env_file:
+      - .env
+    
+    environment:
+      RABBITMQ_URI: ${RABBITMQ_URI:-amqp://rabbituser:rabbitpass@rabbit:5672/}
+    
+    depends_on:
+      rabbit:
+        condition: service_healthy
+    
+    networks:
+      - revolt-network
+
+  # MongoDB Service (example)
+  database:
+    image: mongo:latest
+    container_name: revolt-database
+    restart: unless-stopped
+    
+    volumes:
+      - mongodb_data:/data/db
+    
+    networks:
+      - revolt-network
+    
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+networks:
+  revolt-network:
+    driver: bridge
+
+volumes:
+  rabbitmq_data:
+    driver: local
+  mongodb_data:
+    driver: local
+
+# ==============================================================================
+# REQUIRED .env FILE CONFIGURATION
+# ==============================================================================
+# Create a file named ".env" in the same directory as docker-compose.yml
+# with the following contents:
+#
+# # RabbitMQ Credentials
+# RABBITMQ_USERNAME=rabbituser
+# RABBITMQ_PASSWORD=rabbitpass
+# RABBITMQ_URI=amqp://rabbituser:rabbitpass@rabbit:5672/
+#
+# # For production, use a secure password:
+# # RABBITMQ_PASSWORD=$(openssl rand -base64 32)
+#
+# # MongoDB Credentials (example)
+# MONGODB_URI=mongodb://database:27017/revolt
+#
+# ==============================================================================
+# SECURITY RECOMMENDATIONS
+# ==============================================================================
+# 
+# 1. CHANGE DEFAULT CREDENTIALS
+#    - Never use 'rabbituser:rabbitpass' in production
+#    - Generate strong passwords: openssl rand -base64 32
+#
+# 2. PROTECT .env FILE
+#    - Add .env to .gitignore
+#    - Set proper file permissions: chmod 600 .env
+#    - Never commit credentials to version control
+#
+# 3. USE SECRETS FOR PRODUCTION
+#    - Consider Docker Secrets for Swarm deployments
+#    - Use external secret management (Vault, AWS Secrets Manager, etc.)
+#
+# 4. LIMIT NETWORK EXPOSURE
+#    - Don't expose RabbitMQ ports publicly unless necessary
+#    - Use internal Docker networks for inter-service communication
+#
+# 5. ENABLE TLS/SSL
+#    - For production, configure RabbitMQ with SSL certificates
+#    - Use amqps:// instead of amqp:// in RABBITMQ_URI
+#
+# ==============================================================================
+# TROUBLESHOOTING
+# ==============================================================================
+#
+# If services still fail to connect:
+#
+# 1. Check RabbitMQ is healthy:
+#    docker compose ps rabbit
+#
+# 2. Verify user exists in RabbitMQ:
+#    docker compose exec rabbit rabbitmqctl list_users
+#
+# 3. Check environment variables are loaded:
+#    docker compose config | grep RABBITMQ
+#
+# 4. View RabbitMQ logs:
+#    docker compose logs rabbit
+#
+# 5. Test connection manually:
+#    docker compose exec api env | grep RABBITMQ
+#
+# ==============================================================================
