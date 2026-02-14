@@ -41,6 +41,8 @@ USE_LETSENCRYPT="false"
 LETSENCRYPT_EMAIL=""
 CONFIGURE_FIREWALL="false"
 INSTALL_FAIL2BAN="false"
+INSTALL_SYNAPSE_ADMIN="false"
+SYNAPSE_ADMIN_URL=""
 SSH_ALLOWED_CIDR="any"
 
 TLS_CERT_FILE=""
@@ -335,6 +337,11 @@ configure_prompts() {
     INSTALL_FAIL2BAN="true"
   fi
 
+  if ask_yes_no "Install Synapse Admin (Matrix Synapse admin panel)?" "n"; then
+    INSTALL_SYNAPSE_ADMIN="true"
+    SYNAPSE_ADMIN_URL="$(ask_required_text "Synapse homeserver URL (e.g., https://matrix.example.com)" "https://matrix.gamedns.hu")"
+  fi
+
   # Set URLs based on Nginx configuration
   if [[ "$INSTALL_NGINX" == "true" ]]; then
     REVOLT_API_URL="https://${REVOLT_DOMAIN}/api"
@@ -382,7 +389,29 @@ install_system_packages() {
   fi
 
   if [[ "$INSTALL_FAIL2BAN" == "true" ]]; then
-    pkg_install fail2ban
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+      pkg_install fail2ban
+    else
+      # RHEL/Fedora family - fail2ban requires EPEL
+      log "Installing EPEL repository for fail2ban..."
+      if [[ "$OS_FAMILY" == "fedora" ]]; then
+        pkg_install fail2ban || warn "fail2ban installation failed - skipping"
+      else
+        # RHEL-based systems need EPEL
+        if ! pkg_install epel-release 2>/dev/null; then
+          warn "EPEL repository not available, trying to install from URL..."
+          if [[ "$PKG_MANAGER" == "dnf" ]]; then
+            dnf install -y "https://dl.fedoraproject.org/pub/epel/epel-release-latest-$(rpm -E %rhel).noarch.rpm" 2>/dev/null || warn "Could not install EPEL"
+          else
+            yum install -y "https://dl.fedoraproject.org/pub/epel/epel-release-latest-$(rpm -E %rhel).noarch.rpm" 2>/dev/null || warn "Could not install EPEL"
+          fi
+        fi
+        pkg_install fail2ban || {
+          warn "fail2ban installation failed - this is optional, continuing without it"
+          INSTALL_FAIL2BAN="false"
+        }
+      fi
+    fi
   fi
 }
 
@@ -688,6 +717,22 @@ volumes:
     driver: local
 EOF
 
+  # Add Synapse Admin if requested
+  if [[ "$INSTALL_SYNAPSE_ADMIN" == "true" ]]; then
+    cat >>"${REVOLT_ROOT}/docker-compose.yml" <<EOF
+
+  # Synapse Admin - Matrix Synapse Administration Panel
+  synapse-admin:
+    image: awesometechnologies/synapse-admin:latest
+    container_name: synapse-admin
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    networks:
+      - revolt-network
+EOF
+  fi
+
   chown "$REVOLT_USER:$REVOLT_GROUP" "${REVOLT_ROOT}/docker-compose.yml"
   chmod 644 "${REVOLT_ROOT}/docker-compose.yml"
 }
@@ -896,6 +941,10 @@ configure_ufw() {
     ufw allow 9000/tcp comment 'Revolt WebSocket'
   fi
 
+  if [[ "$INSTALL_SYNAPSE_ADMIN" == "true" ]]; then
+    ufw allow 8080/tcp comment 'Synapse Admin'
+  fi
+
   ufw --force enable
 }
 
@@ -919,12 +968,22 @@ configure_firewalld() {
     firewall-cmd --permanent --add-port=9000/tcp
   fi
 
+  if [[ "$INSTALL_SYNAPSE_ADMIN" == "true" ]]; then
+    firewall-cmd --permanent --add-port=8080/tcp
+  fi
+
   firewall-cmd --reload
 }
 
 configure_firewall_rules() {
   if [[ "$CONFIGURE_FIREWALL" != "true" ]]; then
     return 0
+  fi
+
+  # Validate SSH_ALLOWED_CIDR - if user entered 'y' or invalid, default to 'any'
+  if [[ "${SSH_ALLOWED_CIDR,,}" == "y" || "${SSH_ALLOWED_CIDR,,}" == "yes" ]]; then
+    SSH_ALLOWED_CIDR="any"
+    log "SSH access set to 'any' (allowing from all IPs)"
   fi
 
   if [[ "$OS_FAMILY" == "debian" ]]; then
@@ -988,6 +1047,12 @@ Firewall configured: ${CONFIGURE_FIREWALL}
 SSH source restriction: ${SSH_ALLOWED_CIDR}
 fail2ban installed: ${INSTALL_FAIL2BAN}
 
+Synapse Admin
+-------------
+Synapse Admin installed: ${INSTALL_SYNAPSE_ADMIN}
+Synapse Admin URL: ${SYNAPSE_ADMIN_URL:-not-set}
+Synapse Admin access: http://localhost:8080 (if installed)
+
 Paths
 -----
 Installation root: ${REVOLT_ROOT}
@@ -1015,6 +1080,24 @@ print_final_notes() {
   printf "\n"
   printf "  Access Revolt at: %s\n" "$REVOLT_APP_URL"
   printf "\n"
+  
+  if [[ "$INSTALL_SYNAPSE_ADMIN" == "true" ]]; then
+    printf "  Synapse Admin: http://%s:8080\n" "$(hostname -I | awk '{print $1}')"
+    printf "  (Configure your reverse proxy to expose this on your domain)\n\n"
+  fi
+  
+  if [[ "$INSTALL_NGINX" != "true" ]]; then
+    warn "Nginx not installed - using external reverse proxy mode."
+    printf "  Configure your reverse proxy to forward:\n"
+    printf "    - Web client:  -> http://<server-ip>:3000\n"
+    printf "    - API:         -> http://<server-ip>:8000\n"
+    printf "    - WebSocket:   -> http://<server-ip>:9000\n"
+    if [[ "$INSTALL_SYNAPSE_ADMIN" == "true" ]]; then
+      printf "    - Synapse Admin: -> http://<server-ip>:8080\n"
+    fi
+    printf "\n"
+  fi
+  
   printf "  Full summary saved to: %s\n\n" "$SUMMARY_FILE"
   
   if [[ "$USE_LETSENCRYPT" != "true" && "$INSTALL_NGINX" == "true" ]]; then
