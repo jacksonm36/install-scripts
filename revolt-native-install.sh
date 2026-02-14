@@ -465,10 +465,20 @@ install_mongodb() {
     pkg_install mongodb-org
   else
     # RHEL/Fedora family
+    # MongoDB may not support the latest RHEL versions yet, so we use compatibility mode
+    local rhel_version
+    rhel_version=$(rpm -E %rhel 2>/dev/null || echo "9")
+    
+    # For RHEL 10+, use RHEL 9 repository (compatible)
+    if [[ "$rhel_version" -ge 10 ]]; then
+      warn "Rocky/RHEL ${rhel_version} detected - using RHEL 9 repository for MongoDB (compatible)"
+      rhel_version="9"
+    fi
+    
     cat >/etc/yum.repos.d/mongodb-org-7.0.repo <<EOF
 [mongodb-org-7.0]
 name=MongoDB Repository
-baseurl=https://repo.mongodb.org/yum/redhat/\$releasever/mongodb-org/7.0/x86_64/
+baseurl=https://repo.mongodb.org/yum/redhat/${rhel_version}/mongodb-org/7.0/x86_64/
 gpgcheck=1
 enabled=1
 gpgkey=https://www.mongodb.org/static/pgp/server-7.0.asc
@@ -477,7 +487,9 @@ EOF
     pkg_install mongodb-org
   fi
 
-  systemctl enable --now mongod
+  # Enable and start MongoDB
+  systemctl enable mongod
+  systemctl start mongod
   
   # Wait for MongoDB to start
   local i
@@ -526,19 +538,33 @@ install_rabbitmq() {
     pkg_update
     pkg_install rabbitmq-server
   else
-    # RHEL/Fedora family
-    pkg_install rabbitmq-server
+    # RHEL/Fedora family - use EPEL or direct package
+    if ! pkg_install rabbitmq-server 2>/dev/null; then
+      warn "RabbitMQ not in standard repos, installing from EPEL/RabbitMQ repo..."
+      
+      # Try PackageCloud repository
+      curl -s https://packagecloud.io/install/repositories/rabbitmq/rabbitmq-server/script.rpm.sh | bash
+      pkg_install rabbitmq-server || {
+        # Fallback to Erlang + RabbitMQ manual install
+        pkg_install erlang
+        local rmq_rpm="rabbitmq-server-3.12.13-1.el9.noarch.rpm"
+        wget "https://github.com/rabbitmq/rabbitmq-server/releases/download/v3.12.13/${rmq_rpm}"
+        rpm -Uvh "$rmq_rpm" || yum localinstall -y "$rmq_rpm"
+        rm -f "$rmq_rpm"
+      }
+    fi
   fi
 
-  systemctl enable --now rabbitmq-server
+  systemctl enable rabbitmq-server
+  systemctl start rabbitmq-server
   
   # Wait for RabbitMQ to start
   local i
-  for i in {1..30}; do
+  for i in {1..40}; do
     if rabbitmqctl status >/dev/null 2>&1; then
       break
     fi
-    sleep 1
+    sleep 2
   done
 
   # Create RabbitMQ user
