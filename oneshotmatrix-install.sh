@@ -350,6 +350,45 @@ replace_once(
 "stoat readiness probe without container curl dependency",
 )
 
+replace_once(
+"""COMPOSE_EXIT=0
+docker compose up -d 2>&1 || COMPOSE_EXIT=$?
+if [ "$COMPOSE_EXIT" -ne 0 ]; then
+    fail "Docker failed to start. Run 'cd $INSTALL_DIR && docker compose logs' to see what went wrong."
+fi
+
+ok
+""",
+"""COMPOSE_EXIT=0
+docker compose up -d 2>&1 || COMPOSE_EXIT=$?
+if [ "$COMPOSE_EXIT" -ne 0 ]; then
+    fail "Docker failed to start. Run 'cd $INSTALL_DIR && docker compose logs' to see what went wrong."
+fi
+
+# Keep RabbitMQ credentials in sync with Revolt config, including re-runs with pre-existing rabbit data.
+for i in $(seq 1 60); do
+    if docker compose exec -T rabbit rabbitmq-diagnostics -q ping >/dev/null 2>&1; then
+        break
+    fi
+    if [ "$i" -eq 60 ]; then
+        fail "RabbitMQ did not become ready in time. Run 'cd $INSTALL_DIR && docker compose logs rabbit' for details."
+    fi
+    sleep 2
+done
+
+if ! docker compose exec -T rabbit rabbitmqctl add_user "$RABBIT_USER" "$RABBIT_PASSWORD" >/dev/null 2>&1; then
+    docker compose exec -T rabbit rabbitmqctl change_password "$RABBIT_USER" "$RABBIT_PASSWORD" >/dev/null 2>&1 \
+        || fail "Unable to set RabbitMQ password for user '$RABBIT_USER'."
+fi
+
+docker compose exec -T rabbit rabbitmqctl set_permissions -p / "$RABBIT_USER" ".*" ".*" ".*" >/dev/null 2>&1 \
+    || fail "Unable to set RabbitMQ permissions for user '$RABBIT_USER'."
+
+ok
+""",
+"sync RabbitMQ credentials after compose startup",
+)
+
 setup_path.write_text(text, encoding="utf-8")
 print("Applied hotfixes:")
 if changes:
