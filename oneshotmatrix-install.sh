@@ -13,6 +13,7 @@ REPO_REF="${ONESHOTMATRIX_REF:-$DEFAULT_REPO_REF}"
 SKIP_SETUP="false"
 SKIP_RABBITMQ_FIX="false"
 FORCE_RECLONE="false"
+FIX_RABBITMQ="false"
 OS_FAMILY=""
 PKG_MANAGER=""
 PKG_UPDATED="false"
@@ -40,6 +41,7 @@ Options:
   --skip-setup           Clone/update + patch only, do not run setup.sh
   --skip-rabbitmq-fix    Skip automatic RabbitMQ credential configuration
   --force-reclone        Remove existing install dir before cloning
+  --fix-rabbitmq         Fix RabbitMQ auth (reset data so it reinitializes with .env)
   -h, --help             Show this help
 
 Environment overrides:
@@ -84,6 +86,10 @@ parse_args() {
         FORCE_RECLONE="true"
         shift
         ;;
+      --fix-rabbitmq)
+        FIX_RABBITMQ="true"
+        shift
+        ;;
       -h|--help)
         usage
         exit 0
@@ -97,6 +103,24 @@ parse_args() {
 
 require_root() {
   [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run this script as root."
+}
+
+fix_rabbitmq_auth() {
+  local dir="${INSTALL_DIR:?INSTALL_DIR not set}"
+  [[ -d "$dir" ]] || die "Install directory not found: $dir"
+  [[ -f "$dir/docker-compose.stoat.yml" ]] || die "Stoat compose file not found. Is this a Stoat/Revolt deployment?"
+  [[ -f "$dir/.env" ]] || die ".env not found at $dir/.env"
+  grep -q "^RABBIT_USER=" "$dir/.env" || die "RABBIT_USER not set in .env"
+  grep -q "^RABBIT_PASSWORD=" "$dir/.env" || die "RABBIT_PASSWORD not set in .env"
+
+  log "Stopping RabbitMQ-dependent services..."
+  (cd "$dir" && docker compose stop rabbit api pushd events 2>/dev/null) || true
+  log "Resetting RabbitMQ data (will reinitialize with credentials from .env)..."
+  rm -rf "$dir/data/rabbit"
+  mkdir -p "$dir/data/rabbit"
+  log "Starting services..."
+  (cd "$dir" && docker compose up -d) || die "Docker compose up failed."
+  log "RabbitMQ auth fix complete. API and pushd should connect within ~30 seconds."
 }
 
 detect_os() {
@@ -361,6 +385,26 @@ replace_once(
 "stoat readiness probe without container curl dependency",
 )
 
+replace_once(
+"""cd "$INSTALL_DIR"
+
+COMPOSE_EXIT=0
+docker compose up -d 2>&1 || COMPOSE_EXIT=$?""",
+"""cd "$INSTALL_DIR"
+
+# RabbitMQ only applies RABBITMQ_DEFAULT_* on first init. If credentials in .env
+# were changed, reset RabbitMQ data so it reinitializes with current credentials.
+if [ -d "$DATA_DIR/rabbit" ]; then
+    docker compose stop rabbit api pushd events 2>/dev/null || true
+    rm -rf "$DATA_DIR/rabbit"
+    mkdir -p "$DATA_DIR/rabbit"
+fi
+
+COMPOSE_EXIT=0
+docker compose up -d 2>&1 || COMPOSE_EXIT=$?""",
+"RabbitMQ auth reset on stoat setup re-run",
+)
+
 setup_path.write_text(text, encoding="utf-8")
 print("Applied hotfixes:")
 if changes:
@@ -539,6 +583,12 @@ configure_rabbitmq_credentials() {
 main() {
   parse_args "$@"
   require_root
+
+  if [[ "$FIX_RABBITMQ" == "true" ]]; then
+    fix_rabbitmq_auth
+    exit 0
+  fi
+
   detect_os
 
   log "Detected OS family: ${OS_FAMILY}"
