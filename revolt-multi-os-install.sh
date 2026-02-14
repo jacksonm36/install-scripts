@@ -9,6 +9,17 @@ set -Eeuo pipefail
 
 SCRIPT_VERSION="1.0.0"
 
+# Docker image versions - pinned for stability
+MONGO_VERSION="${REVOLT_MONGO_VERSION:-7.0}"
+REDIS_VERSION="${REVOLT_REDIS_VERSION:-7-alpine}"
+RABBITMQ_VERSION="${REVOLT_RABBITMQ_VERSION:-4}"
+MINIO_VERSION="${REVOLT_MINIO_VERSION:-RELEASE.2024-01-01T00-00-00Z}"
+MINIO_MC_VERSION="${REVOLT_MINIO_MC_VERSION:-RELEASE.2024-01-01T00-00-00Z}"
+REVOLT_API_VERSION="${REVOLT_API_VERSION:-0.7.2}"
+REVOLT_BONFIRE_VERSION="${REVOLT_BONFIRE_VERSION:-0.7.2}"
+REVOLT_PUSHD_VERSION="${REVOLT_PUSHD_VERSION:-0.7.2}"
+REVOLT_WEB_VERSION="${REVOLT_WEB_VERSION:-1.0.0}"
+
 REVOLT_USER="revolt"
 REVOLT_GROUP="revolt"
 REVOLT_ROOT="/opt/revolt"
@@ -30,6 +41,8 @@ RABBITMQ_USERNAME=""
 RABBITMQ_PASSWORD=""
 RABBITMQ_URI=""
 MONGODB_URI=""
+MONGODB_USERNAME=""
+MONGODB_PASSWORD=""
 REDIS_URI=""
 MINIO_ROOT_USER=""
 MINIO_ROOT_PASSWORD=""
@@ -41,8 +54,6 @@ USE_LETSENCRYPT="false"
 LETSENCRYPT_EMAIL=""
 CONFIGURE_FIREWALL="false"
 INSTALL_FAIL2BAN="false"
-INSTALL_SYNAPSE_ADMIN="false"
-SYNAPSE_ADMIN_URL=""
 SSH_ALLOWED_CIDR="any"
 
 TLS_CERT_FILE=""
@@ -74,15 +85,78 @@ die() { err "$*"; exit 1; }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+check_prerequisites() {
+  log "Checking system prerequisites..."
+  
+  # Check Docker version
+  if command_exists docker; then
+    local docker_version
+    docker_version="$(docker --version 2>/dev/null | grep -oP '\d+\.\d+' | head -1)"
+    local docker_major
+    docker_major="${docker_version%%.*}"
+    if [[ -n "$docker_major" && "$docker_major" -lt 20 ]]; then
+      warn "Docker version ${docker_version} detected. Version 20.10+ is recommended."
+    fi
+  fi
+  
+  # Check available disk space (require at least 10GB free)
+  local disk_free_gb
+  disk_free_gb="$(df -BG / | awk 'NR==2 {print $4}' | sed 's/G//')"
+  if [[ "$disk_free_gb" -lt 10 ]]; then
+    warn "Low disk space: ${disk_free_gb}GB free. At least 10GB recommended."
+    if ! ask_yes_no "Continue anyway?" "n"; then
+      die "Installation cancelled due to insufficient disk space."
+    fi
+  fi
+  
+  # Check available RAM (require at least 2GB)
+  local ram_mb
+  ram_mb="$(free -m | awk 'NR==2 {print $2}')"
+  if [[ "$ram_mb" -lt 2048 ]]; then
+    warn "Low RAM: ${ram_mb}MB available. At least 2GB recommended."
+    if ! ask_yes_no "Continue anyway?" "n"; then
+      die "Installation cancelled due to insufficient RAM."
+    fi
+  fi
+  
+  # Check CPU cores (recommend at least 2)
+  local cpu_cores
+  cpu_cores="$(nproc 2>/dev/null || echo 1)"
+  if [[ "$cpu_cores" -lt 2 ]]; then
+    warn "Only ${cpu_cores} CPU core(s) detected. 2+ cores recommended for better performance."
+  fi
+  
+  log "Prerequisites check passed."
+}
+
+cleanup_on_failure() {
+  err "Installation failed. Cleaning up..."
+  
+  # Stop and remove containers if they exist
+  if [[ -f "${REVOLT_ROOT}/docker-compose.yml" ]]; then
+    cd "$REVOLT_ROOT" 2>/dev/null && docker compose down -v 2>/dev/null || true
+  fi
+  
+  # Note: We don't remove the revolt user or directories as they may contain important data
+  warn "Partial installation cleanup completed. Check logs for errors."
+  warn "To fully remove, run: docker compose down -v && rm -rf ${REVOLT_ROOT}"
+}
+
 gen_alnum() {
   local len="${1:-32}"
   local out=""
+  local iterations=0
+  local max_iterations=100
   while [[ "${#out}" -lt "$len" ]]; do
+    if [[ "$iterations" -ge "$max_iterations" ]]; then
+      die "Failed to generate random string after ${max_iterations} attempts"
+    fi
     if command_exists openssl; then
       out+=$(openssl rand -base64 64 | tr -dc 'A-Za-z0-9' | awk -v L="$len" '{print substr($0,1,L)}')
     else
-      out+=$(tr -dc 'A-Za-z0-9' </dev/urandom | awk -v L="$len" '{print substr($0,1,L)}')
+      out+=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$len")
     fi
+    iterations=$((iterations + 1))
   done
   printf '%s' "${out:0:len}"
 }
@@ -93,6 +167,15 @@ gen_hex() {
     openssl rand -hex "$len" | head -c "$((len*2))"
   else
     tr -dc 'a-f0-9' </dev/urandom | head -c "$((len*2))"
+  fi
+}
+
+gen_base64url() {
+  local bytes="${1:-32}"
+  if command_exists openssl; then
+    openssl rand -base64 "$bytes" | tr '+/' '-_' | tr -d '='
+  else
+    head -c "$bytes" </dev/urandom | base64 | tr '+/' '-_' | tr -d '='
   fi
 }
 
@@ -263,7 +346,12 @@ configure_prompts() {
   minio_pass_prompt="$(ask_text "MinIO root password (leave empty to auto-generate)" "")"
   MINIO_ROOT_PASSWORD="${minio_pass_prompt:-$(gen_alnum 32)}"
 
-  MONGODB_URI="mongodb://database:27017/revolt"
+  # MongoDB authentication
+  MONGODB_USERNAME="$(ask_required_text "MongoDB username" "revoltuser")"
+  local mongodb_pass_prompt
+  mongodb_pass_prompt="$(ask_text "MongoDB password (leave empty to auto-generate)" "")"
+  MONGODB_PASSWORD="${mongodb_pass_prompt:-$(gen_alnum 32)}"
+  MONGODB_URI="mongodb://${MONGODB_USERNAME}:${MONGODB_PASSWORD}@database:27017/revolt?authSource=admin"
   REDIS_URI="redis://redis:6379/"
 
   if [[ -n "$FORCE_INSTALL_NGINX" ]]; then
@@ -337,11 +425,6 @@ configure_prompts() {
     INSTALL_FAIL2BAN="true"
   fi
 
-  if ask_yes_no "Install Synapse Admin (Matrix Synapse admin panel)?" "n"; then
-    INSTALL_SYNAPSE_ADMIN="true"
-    SYNAPSE_ADMIN_URL="$(ask_required_text "Synapse homeserver URL (e.g., https://matrix.example.com)" "https://matrix.gamedns.hu")"
-  fi
-
   # Set URLs based on Nginx configuration
   if [[ "$INSTALL_NGINX" == "true" ]]; then
     REVOLT_API_URL="https://${REVOLT_DOMAIN}/api"
@@ -356,9 +439,10 @@ configure_prompts() {
   fi
 
   # Generate VAPID keys (required for push notifications)
+  # VAPID keys must be base64url encoded (RFC 4648) without padding
   log "Generating VAPID keys for push notifications..."
-  VAPID_PRIVATE_KEY="$(gen_hex 32)"
-  VAPID_PUBLIC_KEY="$(gen_hex 32)"
+  VAPID_PRIVATE_KEY="$(gen_base64url 32)"
+  VAPID_PUBLIC_KEY="$(gen_base64url 65)"
 }
 
 install_system_packages() {
@@ -504,6 +588,8 @@ RABBITMQ_URI=${RABBITMQ_URI}
 
 # Database Configuration
 MONGODB_URI=${MONGODB_URI}
+MONGODB_USERNAME=${MONGODB_USERNAME}
+MONGODB_PASSWORD=${MONGODB_PASSWORD}
 REDIS_URI=${REDIS_URI}
 
 # MinIO Configuration (File Storage)
@@ -540,29 +626,61 @@ EOF
 write_docker_compose() {
   log "Writing Docker Compose configuration..."
   
-  cat >"${REVOLT_ROOT}/docker-compose.yml" <<'EOF'
+  # Determine port exposure based on Nginx installation
+  local expose_ports="true"
+  if [[ "$INSTALL_NGINX" == "true" ]]; then
+    expose_ports="false"
+    log "Nginx enabled: Docker services will not expose ports to host"
+  else
+    log "Nginx disabled: Docker services will expose ports to host"
+  fi
+  
+  cat >"${REVOLT_ROOT}/docker-compose.yml" <<EOF
 version: '3.8'
+
+# Revolt Multi-OS Installer
+# Docker Compose Configuration
+# 
+# IMPORTANT: Backup these volumes regularly:
+#   - mongodb_data: User data, messages, channels
+#   - minio_data: File uploads and attachments
+#   - redis_data: Session cache
+#   - rabbitmq_data: Message queue state
 
 services:
   # MongoDB Database
   database:
-    image: mongo:latest
+    image: mongo:${MONGO_VERSION}
     container_name: revolt-database
     restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: \${MONGODB_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: \${MONGODB_PASSWORD}
+      MONGO_INITDB_DATABASE: revolt
     volumes:
       - mongodb_data:/data/db
     networks:
       - revolt-network
     healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      test: |
+        if command -v mongosh >/dev/null 2>&1; then
+          mongosh --quiet --eval "db.adminCommand('ping')" || exit 1
+        else
+          echo 'db.adminCommand("ping")' | mongo --quiet || exit 1
+        fi
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 20s
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # Redis Cache
   redis:
-    image: redis:7-alpine
+    image: redis:${REDIS_VERSION}
     container_name: revolt-redis
     restart: unless-stopped
     volumes:
@@ -575,15 +693,20 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # RabbitMQ Message Queue
   rabbit:
-    image: rabbitmq:4
+    image: rabbitmq:${RABBITMQ_VERSION}
     container_name: revolt-rabbit
     restart: unless-stopped
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_USER: \${RABBITMQ_USERNAME}
+      RABBITMQ_DEFAULT_PASS: \${RABBITMQ_PASSWORD}
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     networks:
@@ -593,17 +716,22 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 20s
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # MinIO S3-compatible Storage
   minio:
-    image: minio/minio:latest
+    image: minio/minio:${MINIO_VERSION}
     container_name: revolt-minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_ROOT_USER: \${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: \${MINIO_ROOT_PASSWORD}
     volumes:
       - minio_data:/data
     networks:
@@ -613,11 +741,16 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 20s
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  # MinIO bucket initialization
+  # MinIO bucket initialization with retry logic
   createbuckets:
-    image: minio/mc:latest
+    image: minio/mc:${MINIO_MC_VERSION}
     container_name: revolt-minio-setup
     depends_on:
       minio:
@@ -626,23 +759,46 @@ services:
       - revolt-network
     entrypoint: >
       /bin/sh -c "
-      /usr/bin/mc alias set myminio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      set -e;
+      echo 'Waiting for MinIO to be fully ready...';
+      sleep 5;
+      max_attempts=30;
+      attempt=0;
+      while [ \$\$attempt -lt \$\$max_attempts ]; do
+        if /usr/bin/mc alias set myminio http://minio:9000 \${MINIO_ROOT_USER} \${MINIO_ROOT_PASSWORD} 2>/dev/null; then
+          echo 'MinIO connection established';
+          break;
+        fi;
+        attempt=\$\$((attempt + 1));
+        echo \"Attempt \$\$attempt/\$\$max_attempts failed, retrying in 2 seconds...\";
+        sleep 2;
+      done;
+      if [ \$\$attempt -eq \$\$max_attempts ]; then
+        echo 'Failed to connect to MinIO after \$\$max_attempts attempts';
+        exit 1;
+      fi;
       /usr/bin/mc mb --ignore-existing myminio/revolt-files;
       /usr/bin/mc anonymous set download myminio/revolt-files;
+      echo 'Bucket setup completed successfully';
       exit 0;
       "
 
   # Revolt API (Delta)
   api:
-    image: ghcr.io/revoltchat/server:latest
+    image: ghcr.io/revoltchat/server:${REVOLT_API_VERSION}
     container_name: revolt-api
     restart: unless-stopped
     env_file:
       - .env
     environment:
-      RABBITMQ_URI: ${RABBITMQ_URI}
-      MONGODB_URI: ${MONGODB_URI}
-      REDIS_URI: ${REDIS_URI}
+      RABBITMQ_URI: \${RABBITMQ_URI}
+      MONGODB_URI: \${MONGODB_URI}
+      REDIS_URI: \${REDIS_URI}
+      S3_REGION: \${S3_REGION}
+      S3_BUCKET: \${S3_BUCKET}
+      MINIO_ENDPOINT: \${MINIO_ENDPOINT}
+      MINIO_ROOT_USER: \${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: \${MINIO_ROOT_PASSWORD}
     depends_on:
       rabbit:
         condition: service_healthy
@@ -650,57 +806,127 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      minio:
+        condition: service_healthy
+EOF
+
+  if [[ "$expose_ports" == "true" ]]; then
+    cat >>"${REVOLT_ROOT}/docker-compose.yml" <<EOF
     ports:
       - "8000:8000"
+EOF
+  fi
+
+  cat >>"${REVOLT_ROOT}/docker-compose.yml" <<EOF
     networks:
       - revolt-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # Revolt Events WebSocket
   events:
-    image: ghcr.io/revoltchat/bonfire:latest
+    image: ghcr.io/revoltchat/bonfire:${REVOLT_BONFIRE_VERSION}
     container_name: revolt-events
     restart: unless-stopped
     env_file:
       - .env
     environment:
-      RABBITMQ_URI: ${RABBITMQ_URI}
+      RABBITMQ_URI: \${RABBITMQ_URI}
     depends_on:
       rabbit:
         condition: service_healthy
+EOF
+
+  if [[ "$expose_ports" == "true" ]]; then
+    cat >>"${REVOLT_ROOT}/docker-compose.yml" <<EOF
     ports:
       - "9000:9000"
+EOF
+  fi
+
+  cat >>"${REVOLT_ROOT}/docker-compose.yml" <<EOF
     networks:
       - revolt-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # Revolt Push Notifications Daemon
   pushd:
-    image: ghcr.io/revoltchat/pushd:latest
+    image: ghcr.io/revoltchat/pushd:${REVOLT_PUSHD_VERSION}
     container_name: revolt-pushd
     restart: unless-stopped
     env_file:
       - .env
     environment:
-      RABBITMQ_URI: ${RABBITMQ_URI}
-      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY}
-      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY}
+      RABBITMQ_URI: \${RABBITMQ_URI}
+      VAPID_PRIVATE_KEY: \${VAPID_PRIVATE_KEY}
+      VAPID_PUBLIC_KEY: \${VAPID_PUBLIC_KEY}
     depends_on:
       rabbit:
         condition: service_healthy
     networks:
       - revolt-network
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f pushd || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # Revolt Web Client
   web:
-    image: ghcr.io/revoltchat/client:latest
+    image: ghcr.io/revoltchat/client:${REVOLT_WEB_VERSION}
     container_name: revolt-web
     restart: unless-stopped
     environment:
-      REVOLT_API_URL: ${REVOLT_EXTERNAL_API_URL}
-      REVOLT_WS_URL: ${REVOLT_EXTERNAL_WS_URL}
+      REVOLT_API_URL: \${REVOLT_EXTERNAL_API_URL}
+      REVOLT_WS_URL: \${REVOLT_EXTERNAL_WS_URL}
+EOF
+
+  if [[ "$expose_ports" == "true" ]]; then
+    cat >>"${REVOLT_ROOT}/docker-compose.yml" <<EOF
     ports:
       - "3000:3000"
+EOF
+  fi
+
+  cat >>"${REVOLT_ROOT}/docker-compose.yml" <<EOF
     networks:
       - revolt-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 networks:
   revolt-network:
@@ -716,22 +942,6 @@ volumes:
   minio_data:
     driver: local
 EOF
-
-  # Add Synapse Admin if requested
-  if [[ "$INSTALL_SYNAPSE_ADMIN" == "true" ]]; then
-    cat >>"${REVOLT_ROOT}/docker-compose.yml" <<EOF
-
-  # Synapse Admin - Matrix Synapse Administration Panel
-  synapse-admin:
-    image: awesometechnologies/synapse-admin:latest
-    container_name: synapse-admin
-    restart: unless-stopped
-    ports:
-      - "8080:80"
-    networks:
-      - revolt-network
-EOF
-  fi
 
   chown "$REVOLT_USER:$REVOLT_GROUP" "${REVOLT_ROOT}/docker-compose.yml"
   chmod 644 "${REVOLT_ROOT}/docker-compose.yml"
@@ -783,6 +993,24 @@ configure_nginx() {
   log "Configuring Nginx reverse proxy..."
   mkdir -p /etc/nginx/conf.d /var/www/certbot
   rm -f /etc/nginx/conf.d/default.conf /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default
+
+  # Wait for Revolt services to be ready before configuring Nginx
+  log "Waiting for Revolt services to be ready..."
+  local max_wait=120
+  local waited=0
+  while [[ "$waited" -lt "$max_wait" ]]; do
+    if curl -f http://127.0.0.1:3000/ >/dev/null 2>&1 && \
+       curl -f http://127.0.0.1:8000/ >/dev/null 2>&1; then
+      log "Revolt services are ready"
+      break
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  
+  if [[ "$waited" -ge "$max_wait" ]]; then
+    warn "Revolt services may not be fully ready yet. Nginx will still be configured."
+  fi
 
   # Bootstrap HTTP config first (used for ACME challenge and initial startup).
   cat >/etc/nginx/conf.d/revolt-bootstrap.conf <<EOF
@@ -941,11 +1169,15 @@ configure_ufw() {
     ufw allow 9000/tcp comment 'Revolt WebSocket'
   fi
 
-  if [[ "$INSTALL_SYNAPSE_ADMIN" == "true" ]]; then
-    ufw allow 8080/tcp comment 'Synapse Admin'
-  fi
-
   ufw --force enable
+  
+  # Docker firewall conflict warning
+  warn "IMPORTANT: Docker bypasses UFW rules by default."
+  warn "If you need strict firewall control, configure Docker to respect UFW:"
+  warn "  1. Edit /etc/docker/daemon.json"
+  warn "  2. Add: {\"iptables\": false}"
+  warn "  3. Restart Docker: systemctl restart docker"
+  warn "  4. Manually configure iptables rules for Docker networks"
 }
 
 configure_firewalld() {
@@ -968,11 +1200,11 @@ configure_firewalld() {
     firewall-cmd --permanent --add-port=9000/tcp
   fi
 
-  if [[ "$INSTALL_SYNAPSE_ADMIN" == "true" ]]; then
-    firewall-cmd --permanent --add-port=8080/tcp
-  fi
-
   firewall-cmd --reload
+  
+  # Docker firewall conflict warning
+  warn "IMPORTANT: Docker may bypass firewalld rules."
+  warn "Ensure Docker network zones are properly configured if strict control is needed."
 }
 
 configure_firewall_rules() {
@@ -1027,6 +1259,8 @@ Console: http://localhost:9001 (internal)
 Database Configuration
 ----------------------
 MongoDB URI: ${MONGODB_URI}
+MongoDB Username: ${MONGODB_USERNAME}
+MongoDB Password: ${MONGODB_PASSWORD}
 Redis URI: ${REDIS_URI}
 
 VAPID Keys (Push Notifications)
@@ -1047,11 +1281,16 @@ Firewall configured: ${CONFIGURE_FIREWALL}
 SSH source restriction: ${SSH_ALLOWED_CIDR}
 fail2ban installed: ${INSTALL_FAIL2BAN}
 
-Synapse Admin
--------------
-Synapse Admin installed: ${INSTALL_SYNAPSE_ADMIN}
-Synapse Admin URL: ${SYNAPSE_ADMIN_URL:-not-set}
-Synapse Admin access: http://localhost:8080 (if installed)
+Docker Image Versions
+---------------------
+MongoDB: ${MONGO_VERSION}
+Redis: ${REDIS_VERSION}
+RabbitMQ: ${RABBITMQ_VERSION}
+MinIO: ${MINIO_VERSION}
+Revolt API: ${REVOLT_API_VERSION}
+Revolt Events: ${REVOLT_BONFIRE_VERSION}
+Revolt Pushd: ${REVOLT_PUSHD_VERSION}
+Revolt Web: ${REVOLT_WEB_VERSION}
 
 Paths
 -----
@@ -1059,6 +1298,20 @@ Installation root: ${REVOLT_ROOT}
 Data directory: ${REVOLT_DATA}
 Configuration: ${REVOLT_CONFIG}
 Docker Compose: ${REVOLT_ROOT}/docker-compose.yml
+
+Important: Data Backups
+------------------------
+Regularly backup these Docker volumes:
+  - mongodb_data: User data, messages, channels
+  - minio_data: File uploads and attachments
+  - redis_data: Session cache
+  - rabbitmq_data: Message queue state
+
+Backup command:
+  cd ${REVOLT_ROOT}
+  docker compose down
+  tar -czf revolt-backup-\$(date +%Y%m%d).tar.gz ${REVOLT_DATA}
+  docker compose up -d
 
 Useful Commands
 ---------------
@@ -1081,20 +1334,12 @@ print_final_notes() {
   printf "  Access Revolt at: %s\n" "$REVOLT_APP_URL"
   printf "\n"
   
-  if [[ "$INSTALL_SYNAPSE_ADMIN" == "true" ]]; then
-    printf "  Synapse Admin: http://%s:8080\n" "$(hostname -I | awk '{print $1}')"
-    printf "  (Configure your reverse proxy to expose this on your domain)\n\n"
-  fi
-  
   if [[ "$INSTALL_NGINX" != "true" ]]; then
     warn "Nginx not installed - using external reverse proxy mode."
     printf "  Configure your reverse proxy to forward:\n"
     printf "    - Web client:  -> http://<server-ip>:3000\n"
     printf "    - API:         -> http://<server-ip>:8000\n"
     printf "    - WebSocket:   -> http://<server-ip>:9000\n"
-    if [[ "$INSTALL_SYNAPSE_ADMIN" == "true" ]]; then
-      printf "    - Synapse Admin: -> http://<server-ip>:8080\n"
-    fi
     printf "\n"
   fi
   
@@ -1104,10 +1349,17 @@ print_final_notes() {
     warn "Self-signed certificate is in use. You may see browser warnings."
     warn "For production, consider using Let's Encrypt or a valid certificate."
   fi
+  
+  warn "IMPORTANT: Regularly backup the Docker volumes to prevent data loss."
+  warn "See backup instructions in: ${SUMMARY_FILE}"
 }
 
 main() {
+  # Set up cleanup trap
+  trap cleanup_on_failure ERR
+  
   detect_os
+  check_prerequisites
   configure_prompts
   install_system_packages
   install_docker
@@ -1128,6 +1380,9 @@ main() {
 
   write_summary
   print_final_notes
+  
+  # Disable trap on successful completion
+  trap - ERR
 }
 
 main "$@"
