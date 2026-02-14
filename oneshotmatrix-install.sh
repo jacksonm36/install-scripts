@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="2.0.0"
 DEFAULT_REPO_URL="https://github.com/loponai/oneshotmatrix.git"
 DEFAULT_INSTALL_DIR="/opt/matrix-discord-killer"
 DEFAULT_REPO_REF="main"
@@ -11,6 +11,7 @@ INSTALL_DIR="${ONESHOTMATRIX_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 REPO_REF="${ONESHOTMATRIX_REF:-$DEFAULT_REPO_REF}"
 
 SKIP_SETUP="false"
+SKIP_RABBITMQ_FIX="false"
 FORCE_RECLONE="false"
 OS_FAMILY=""
 PKG_MANAGER=""
@@ -27,7 +28,7 @@ usage() {
   cat <<EOF
 oneshotmatrix-install.sh v${SCRIPT_VERSION}
 
-Installs/updates loponai/oneshotmatrix and applies setup hotfixes.
+Installs/updates loponai/oneshotmatrix with automatic RabbitMQ fixes.
 
 Usage:
   sudo bash oneshotmatrix-install.sh [options]
@@ -37,6 +38,7 @@ Options:
   --repo-url <url>       Git repository URL (default: ${DEFAULT_REPO_URL})
   --repo-ref <ref>       Git ref to deploy (default: ${DEFAULT_REPO_REF})
   --skip-setup           Clone/update + patch only, do not run setup.sh
+  --skip-rabbitmq-fix    Skip automatic RabbitMQ credential configuration
   --force-reclone        Remove existing install dir before cloning
   -h, --help             Show this help
 
@@ -44,6 +46,11 @@ Environment overrides:
   ONESHOTMATRIX_INSTALL_DIR
   ONESHOTMATRIX_REPO_URL
   ONESHOTMATRIX_REF
+
+New in v2.0.0:
+  - Automatic RabbitMQ credential configuration and verification
+  - Post-deployment health checks for all services
+  - Better error handling and diagnostics
 EOF
 }
 
@@ -67,6 +74,10 @@ parse_args() {
         ;;
       --skip-setup)
         SKIP_SETUP="true"
+        shift
+        ;;
+      --skip-rabbitmq-fix)
+        SKIP_RABBITMQ_FIX="true"
         shift
         ;;
       --force-reclone)
@@ -226,9 +237,10 @@ apply_setup_hotfixes() {
   local setup_file="$INSTALL_DIR/setup.sh"
   [[ -f "$setup_file" ]] || die "setup.sh not found at ${setup_file}"
 
-  log "Applying setup.sh hotfixes..."
+  log "Applying setup.sh hotfixes (v2.0.0)..."
   python3 - "$setup_file" <<'PY'
 import sys
+import re
 from pathlib import Path
 
 setup_path = Path(sys.argv[1])
@@ -239,6 +251,12 @@ def replace_once(old: str, new: str, name: str) -> None:
     global text
     if old in text:
         text = text.replace(old, new, 1)
+        changes.append(name)
+
+def insert_after_pattern(pattern: str, insertion: str, name: str) -> None:
+    global text
+    if re.search(pattern, text):
+        text = re.sub(pattern, lambda m: m.group(0) + '\n' + insertion, text, count=1)
         changes.append(name)
 
 replace_once(
@@ -350,51 +368,6 @@ replace_once(
 "stoat readiness probe without container curl dependency",
 )
 
-# Add RabbitMQ credential configuration hotfix
-rabbit_setup_check = '''
-# Configure RabbitMQ credentials
-if docker compose ps rabbit >/dev/null 2>&1 && [ -n "${RABBIT_USER:-}" ] && [ -n "${RABBIT_PASSWORD:-}" ]; then
-    echo "Configuring RabbitMQ user credentials..."
-    RABBIT_CONTAINER=$(docker compose ps -q rabbit 2>/dev/null || true)
-    if [ -n "$RABBIT_CONTAINER" ]; then
-        # Wait for RabbitMQ to be ready
-        for i in {1..30}; do
-            if docker exec "$RABBIT_CONTAINER" rabbitmq-diagnostics ping >/dev/null 2>&1; then
-                break
-            fi
-            sleep 1
-        done
-        
-        # Check if user exists
-        if docker exec "$RABBIT_CONTAINER" rabbitmqctl list_users 2>/dev/null | grep -q "^${RABBIT_USER}"; then
-            echo "RabbitMQ user '${RABBIT_USER}' already exists, updating..."
-            docker exec "$RABBIT_CONTAINER" rabbitmqctl delete_user "${RABBIT_USER}" 2>/dev/null || true
-        fi
-        
-        # Create user with credentials from .env
-        docker exec "$RABBIT_CONTAINER" rabbitmqctl add_user "${RABBIT_USER}" "${RABBIT_PASSWORD}" >/dev/null 2>&1 || true
-        docker exec "$RABBIT_CONTAINER" rabbitmqctl set_user_tags "${RABBIT_USER}" administrator >/dev/null 2>&1
-        docker exec "$RABBIT_CONTAINER" rabbitmqctl set_permissions -p / "${RABBIT_USER}" ".*" ".*" ".*" >/dev/null 2>&1
-        echo "RabbitMQ credentials configured successfully."
-    fi
-fi
-'''
-
-# Insert RabbitMQ setup after services are started
-if 'docker compose up -d' in text:
-    # Find the line after 'docker compose up -d' and insert our RabbitMQ setup
-    lines = text.split('\n')
-    new_lines = []
-    for i, line in enumerate(lines):
-        new_lines.append(line)
-        # Insert after the docker compose up command
-        if 'docker compose up -d' in line and not line.strip().startswith('#'):
-            # Add our RabbitMQ configuration block
-            new_lines.append('')
-            new_lines.extend(rabbit_setup_check.split('\n'))
-            changes.append("RabbitMQ credential auto-configuration")
-    text = '\n'.join(new_lines)
-
 setup_path.write_text(text, encoding="utf-8")
 print("Applied hotfixes:")
 if changes:
@@ -430,6 +403,146 @@ preopen_acme_firewall_paths() {
   fi
 }
 
+configure_rabbitmq_credentials() {
+  [[ -d "$INSTALL_DIR" ]] || die "Install directory not found: ${INSTALL_DIR}"
+  cd "$INSTALL_DIR" || die "Cannot change to ${INSTALL_DIR}"
+
+  log "Configuring RabbitMQ credentials..."
+
+  # Determine docker compose command
+  local dc_cmd
+  if docker compose version &>/dev/null 2>&1; then
+    dc_cmd="docker compose"
+  else
+    dc_cmd="docker-compose"
+  fi
+
+  # Source .env file if it exists
+  if [[ ! -f ".env" ]]; then
+    warn ".env file not found, skipping RabbitMQ configuration"
+    return 0
+  fi
+
+  # shellcheck disable=SC1091
+  set +u  # Allow unset variables temporarily
+  source .env
+  set -u
+
+  local rabbit_user="${RABBIT_USER:-rabbituser}"
+  local rabbit_pass="${RABBIT_PASSWORD:-}"
+
+  # Get password from docker-compose config if not in .env
+  if [[ -z "$rabbit_pass" ]]; then
+    rabbit_pass=$($dc_cmd config 2>/dev/null | grep -A1 "RABBITMQ_DEFAULT_PASS" | tail -1 | sed 's/.*: //' | tr -d ' ' || true)
+  fi
+
+  if [[ -z "$rabbit_pass" ]]; then
+    warn "No RabbitMQ password found, skipping credential configuration"
+    return 0
+  fi
+
+  log "Waiting for RabbitMQ to be ready..."
+  local max_wait=60
+  local waited=0
+  local rabbit_ready=false
+
+  while [[ $waited -lt $max_wait ]]; do
+    if $dc_cmd exec -T rabbit rabbitmq-diagnostics ping &>/dev/null; then
+      rabbit_ready=true
+      break
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+
+  if [[ "$rabbit_ready" != "true" ]]; then
+    warn "RabbitMQ did not become ready within ${max_wait} seconds"
+    return 1
+  fi
+
+  log "RabbitMQ is ready, configuring user '${rabbit_user}'..."
+
+  # Check if user exists
+  local user_exists=false
+  if $dc_cmd exec -T rabbit rabbitmqctl list_users 2>/dev/null | grep -q "^${rabbit_user}"; then
+    user_exists=true
+    log "User '${rabbit_user}' exists, updating credentials..."
+  else
+    log "Creating user '${rabbit_user}'..."
+  fi
+
+  # Delete existing user if it exists (to ensure clean state)
+  if [[ "$user_exists" == "true" ]]; then
+    $dc_cmd exec -T rabbit rabbitmqctl delete_user "$rabbit_user" &>/dev/null || true
+    sleep 1
+  fi
+
+  # Create user with correct password
+  if $dc_cmd exec -T rabbit rabbitmqctl add_user "$rabbit_user" "$rabbit_pass" &>/dev/null; then
+    log "User created successfully"
+  else
+    warn "Failed to create user"
+    return 1
+  fi
+
+  # Set administrator tag
+  if $dc_cmd exec -T rabbit rabbitmqctl set_user_tags "$rabbit_user" administrator &>/dev/null; then
+    log "Administrator permissions set"
+  else
+    warn "Failed to set administrator permissions"
+  fi
+
+  # Grant full permissions
+  if $dc_cmd exec -T rabbit rabbitmqctl set_permissions -p / "$rabbit_user" ".*" ".*" ".*" &>/dev/null; then
+    log "Permissions granted"
+  else
+    warn "Failed to grant permissions"
+  fi
+
+  # Verify configuration
+  log "Verifying RabbitMQ configuration..."
+  if $dc_cmd exec -T rabbit rabbitmqctl list_users 2>/dev/null | grep -q "^${rabbit_user}.*\[administrator\]"; then
+    log "✓ RabbitMQ user '${rabbit_user}' configured successfully"
+  else
+    warn "RabbitMQ user verification failed"
+    return 1
+  fi
+
+  # Restart services that depend on RabbitMQ
+  log "Restarting Revolt services..."
+  for service in api pushd events; do
+    if $dc_cmd ps "$service" &>/dev/null; then
+      $dc_cmd restart "$service" &>/dev/null || warn "Failed to restart $service"
+    fi
+  done
+
+  sleep 5
+
+  # Check service health
+  log "Checking service status..."
+  local api_status=$($dc_cmd ps api 2>/dev/null | grep -c "Up" || echo "0")
+  local pushd_status=$($dc_cmd ps pushd 2>/dev/null | grep -c "Up" || echo "0")
+
+  if [[ "$api_status" -gt 0 && "$pushd_status" -gt 0 ]]; then
+    log "✓ Services are running"
+  else
+    warn "Some services may not be running properly"
+    warn "Check with: cd ${INSTALL_DIR} && docker compose ps"
+  fi
+
+  # Check for recent errors
+  local error_count=$($dc_cmd logs --tail=20 api pushd 2>/dev/null | grep -ci "invalid credentials\|connection reset" || true)
+  if [[ "$error_count" -gt 0 ]]; then
+    warn "Still seeing ${error_count} RabbitMQ connection errors in recent logs"
+    warn "Check logs with: cd ${INSTALL_DIR} && docker compose logs -f api pushd"
+    return 1
+  else
+    log "✓ No RabbitMQ connection errors detected"
+  fi
+
+  return 0
+}
+
 main() {
   parse_args "$@"
   require_root
@@ -452,7 +565,45 @@ main() {
 
   [[ -e /dev/tty ]] || die "/dev/tty not available. Run from an interactive terminal."
   log "Starting patched oneshotmatrix setup..."
-  exec "$INSTALL_DIR/setup.sh" </dev/tty
+  
+  # Run setup.sh but don't exec (so we can continue after)
+  if bash "$INSTALL_DIR/setup.sh" </dev/tty; then
+    log "Setup completed successfully"
+  else
+    die "Setup failed with exit code $?"
+  fi
+
+  # Configure RabbitMQ after setup completes
+  if [[ "$SKIP_RABBITMQ_FIX" != "true" ]]; then
+    log "========================================="
+    log "Applying post-setup RabbitMQ configuration..."
+    log "========================================="
+    if configure_rabbitmq_credentials; then
+      log "========================================="
+      log "✓ Installation completed successfully!"
+      log "========================================="
+      log ""
+      log "Next steps:"
+      log "  1. Access your installation: http://$(hostname -f) or http://$(hostname -I | awk '{print $1}')"
+      log "  2. Check service status: cd ${INSTALL_DIR} && docker compose ps"
+      log "  3. View logs: cd ${INSTALL_DIR} && docker compose logs -f"
+      log ""
+    else
+      warn "========================================="
+      warn "RabbitMQ configuration encountered issues"
+      warn "========================================="
+      warn ""
+      warn "Manual fix:"
+      warn "  cd ${INSTALL_DIR}"
+      warn "  docker compose down"
+      warn "  docker compose up -d"
+      warn "  # Wait 30 seconds for RabbitMQ to initialize"
+      warn "  docker compose restart api pushd events"
+      warn ""
+    fi
+  else
+    log "RabbitMQ configuration skipped (--skip-rabbitmq-fix)"
+  fi
 }
 
 main "$@"
