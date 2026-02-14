@@ -43,6 +43,10 @@ CONFIGURE_FIREWALL="false"
 INSTALL_FAIL2BAN="false"
 INSTALL_SYNAPSE_ADMIN="false"
 SYNAPSE_ADMIN_URL=""
+CREATE_ADMIN_ACCOUNT="false"
+ADMIN_EMAIL=""
+ADMIN_USERNAME=""
+ADMIN_PASSWORD=""
 SSH_ALLOWED_CIDR="any"
 
 TLS_CERT_FILE=""
@@ -241,17 +245,27 @@ pkg_install() {
 }
 
 configure_prompts() {
-  local default_host
+  local default_host default_ip
   default_host="$(hostname -f 2>/dev/null || hostname)"
+  default_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  
   if [[ -z "$default_host" ]]; then
-    default_host="revolt.local"
+    default_host="${default_ip:-revolt.local}"
   fi
 
-  printf "\nRevolt interactive installer v%s\n" "$SCRIPT_VERSION"
-  printf "Detected OS: %s\n\n" "$PRETTY_NAME"
+  printf "\n╔════════════════════════════════════════════════════════════╗\n"
+  printf "║         Revolt Interactive Installer v%s              ║\n" "$SCRIPT_VERSION"
+  printf "╚════════════════════════════════════════════════════════════╝\n"
+  printf "Detected OS: %s\n" "$PRETTY_NAME"
+  if [[ -n "$default_ip" ]]; then
+    printf "Server IP: %s\n" "$default_ip"
+  fi
+  printf "\n"
 
-  REVOLT_DOMAIN="$(ask_required_text "Revolt domain (e.g., revolt.example.com)" "${PREFERRED_REVOLT_DOMAIN:-$default_host}")"
+  printf "═══ Domain Configuration ═══\n"
+  REVOLT_DOMAIN="$(ask_required_text "Revolt domain or IP (e.g., revolt.example.com or ${default_ip})" "${PREFERRED_REVOLT_DOMAIN:-$default_host}")"
 
+  printf "\n═══ Database & Services Configuration ═══\n"
   RABBITMQ_USERNAME="$(ask_required_text "RabbitMQ username" "rabbituser")"
   local rabbit_pass_prompt
   rabbit_pass_prompt="$(ask_text "RabbitMQ password (leave empty to auto-generate)" "")"
@@ -266,6 +280,7 @@ configure_prompts() {
   MONGODB_URI="mongodb://database:27017/revolt"
   REDIS_URI="redis://redis:6379/"
 
+  printf "\n═══ Web Server & TLS Configuration ═══\n"
   if [[ -n "$FORCE_INSTALL_NGINX" ]]; then
     case "${FORCE_INSTALL_NGINX,,}" in
       1|true|yes|y)
@@ -309,6 +324,7 @@ configure_prompts() {
     fi
   fi
 
+  printf "\n═══ Security Configuration ═══\n"
   if [[ -n "$FORCE_CONFIGURE_FIREWALL" ]]; then
     case "${FORCE_CONFIGURE_FIREWALL,,}" in
       1|true|yes|y)
@@ -337,9 +353,20 @@ configure_prompts() {
     INSTALL_FAIL2BAN="true"
   fi
 
+  printf "\n═══ Optional Components ═══\n"
   if ask_yes_no "Install Synapse Admin (Matrix Synapse admin panel)?" "n"; then
     INSTALL_SYNAPSE_ADMIN="true"
     SYNAPSE_ADMIN_URL="$(ask_required_text "Synapse homeserver URL (e.g., https://matrix.example.com)" "https://matrix.gamedns.hu")"
+  fi
+
+  printf "\n═══ Admin Account Setup ═══\n"
+  if ask_yes_no "Create a Revolt admin account now?" "y"; then
+    CREATE_ADMIN_ACCOUNT="true"
+    ADMIN_USERNAME="$(ask_required_text "Admin username" "admin")"
+    ADMIN_EMAIL="$(ask_required_text "Admin email" "admin@${REVOLT_DOMAIN}")"
+    local admin_pass_input
+    admin_pass_input="$(ask_text "Admin password (leave empty to auto-generate)" "")"
+    ADMIN_PASSWORD="${admin_pass_input:-$(gen_alnum 24)}"
   fi
 
   # Set URLs based on Nginx configuration
@@ -748,10 +775,77 @@ start_revolt_services() {
   runuser -u "$REVOLT_USER" -- docker compose up -d
   
   log "Waiting for services to start..."
-  sleep 10
+  sleep 15
   
   # Check service status
   runuser -u "$REVOLT_USER" -- docker compose ps
+}
+
+wait_for_revolt_api() {
+  log "Waiting for Revolt API to become ready..."
+  local i
+  local api_url="http://127.0.0.1:8000"
+  
+  for i in {1..60}; do
+    if curl -fsS "${api_url}/" >/dev/null 2>&1; then
+      log "Revolt API is ready!"
+      return 0
+    fi
+    sleep 2
+  done
+  
+  warn "Revolt API did not become ready in time, but continuing..."
+  return 1
+}
+
+create_admin_account() {
+  if [[ "$CREATE_ADMIN_ACCOUNT" != "true" ]]; then
+    return 0
+  fi
+
+  log "Creating Revolt admin account..."
+  
+  # Wait for API to be ready
+  if ! wait_for_revolt_api; then
+    warn "Could not verify API is ready. Admin account creation may fail."
+  fi
+
+  local api_url="http://127.0.0.1:8000"
+  local signup_response
+  local user_id
+  local session_token
+  
+  # Create account via API
+  signup_response=$(curl -fsS -X POST "${api_url}/auth/account/create" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"email\": \"${ADMIN_EMAIL}\",
+      \"password\": \"${ADMIN_PASSWORD}\",
+      \"captcha\": null
+    }" 2>/dev/null)
+  
+  if [[ $? -eq 0 ]] && [[ -n "$signup_response" ]]; then
+    log "Admin account created successfully!"
+    
+    # Try to extract user ID from response
+    user_id=$(echo "$signup_response" | jq -r '._id // .id // empty' 2>/dev/null)
+    
+    if [[ -n "$user_id" ]]; then
+      log "Admin User ID: ${user_id}"
+      
+      # Update MongoDB to grant admin privileges
+      local mongo_cmd="db.users.updateOne({_id: '${user_id}'}, {\$set: {privileged: true, badges: 1}})"
+      
+      if docker exec revolt-database mongosh revolt --eval "$mongo_cmd" >/dev/null 2>&1; then
+        log "Admin privileges granted to user: ${ADMIN_USERNAME}"
+      else
+        warn "Could not grant admin privileges automatically. You can do this manually later."
+      fi
+    fi
+  else
+    warn "Failed to create admin account via API."
+    warn "You can create it manually after installation via the web interface."
+  fi
 }
 
 create_self_signed_cert() {
@@ -1053,6 +1147,13 @@ Synapse Admin installed: ${INSTALL_SYNAPSE_ADMIN}
 Synapse Admin URL: ${SYNAPSE_ADMIN_URL:-not-set}
 Synapse Admin access: http://localhost:8080 (if installed)
 
+Admin Account
+-------------
+Admin account created: ${CREATE_ADMIN_ACCOUNT}
+Admin username: ${ADMIN_USERNAME:-not-created}
+Admin email: ${ADMIN_EMAIL:-not-created}
+Admin password: ${ADMIN_PASSWORD:-not-set}
+
 Paths
 -----
 Installation root: ${REVOLT_ROOT}
@@ -1087,18 +1188,20 @@ print_final_notes() {
   fi
   
   if [[ "$INSTALL_NGINX" != "true" ]]; then
-    warn "Nginx not installed - using external reverse proxy mode."
+    printf "🔀 External Reverse Proxy Configuration:\n"
+    local server_ip
+    server_ip="$(hostname -I | awk '{print $1}')"
     printf "  Configure your reverse proxy to forward:\n"
-    printf "    - Web client:  -> http://<server-ip>:3000\n"
-    printf "    - API:         -> http://<server-ip>:8000\n"
-    printf "    - WebSocket:   -> http://<server-ip>:9000\n"
+    printf "    ├─ Web client:    -> http://%s:3000\n" "$server_ip"
+    printf "    ├─ API:           -> http://%s:8000\n" "$server_ip"
+    printf "    ├─ WebSocket:     -> http://%s:9000\n" "$server_ip"
     if [[ "$INSTALL_SYNAPSE_ADMIN" == "true" ]]; then
-      printf "    - Synapse Admin: -> http://<server-ip>:8080\n"
+      printf "    └─ Synapse Admin: -> http://%s:8080\n" "$server_ip"
     fi
     printf "\n"
   fi
   
-  printf "  Full summary saved to: %s\n\n" "$SUMMARY_FILE"
+  printf "📄 Full summary saved to: %s\n\n" "$SUMMARY_FILE"
   
   if [[ "$USE_LETSENCRYPT" != "true" && "$INSTALL_NGINX" == "true" ]]; then
     warn "Self-signed certificate is in use. You may see browser warnings."
@@ -1125,6 +1228,9 @@ main() {
   if [[ "$INSTALL_FAIL2BAN" == "true" ]]; then
     configure_fail2ban
   fi
+
+  # Create admin account after services are running
+  create_admin_account
 
   write_summary
   print_final_notes
