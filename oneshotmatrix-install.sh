@@ -350,6 +350,51 @@ replace_once(
 "stoat readiness probe without container curl dependency",
 )
 
+# Add RabbitMQ credential configuration hotfix
+rabbit_setup_check = '''
+# Configure RabbitMQ credentials
+if docker compose ps rabbit >/dev/null 2>&1 && [ -n "${RABBIT_USER:-}" ] && [ -n "${RABBIT_PASSWORD:-}" ]; then
+    echo "Configuring RabbitMQ user credentials..."
+    RABBIT_CONTAINER=$(docker compose ps -q rabbit 2>/dev/null || true)
+    if [ -n "$RABBIT_CONTAINER" ]; then
+        # Wait for RabbitMQ to be ready
+        for i in {1..30}; do
+            if docker exec "$RABBIT_CONTAINER" rabbitmq-diagnostics ping >/dev/null 2>&1; then
+                break
+            fi
+            sleep 1
+        done
+        
+        # Check if user exists
+        if docker exec "$RABBIT_CONTAINER" rabbitmqctl list_users 2>/dev/null | grep -q "^${RABBIT_USER}"; then
+            echo "RabbitMQ user '${RABBIT_USER}' already exists, updating..."
+            docker exec "$RABBIT_CONTAINER" rabbitmqctl delete_user "${RABBIT_USER}" 2>/dev/null || true
+        fi
+        
+        # Create user with credentials from .env
+        docker exec "$RABBIT_CONTAINER" rabbitmqctl add_user "${RABBIT_USER}" "${RABBIT_PASSWORD}" >/dev/null 2>&1 || true
+        docker exec "$RABBIT_CONTAINER" rabbitmqctl set_user_tags "${RABBIT_USER}" administrator >/dev/null 2>&1
+        docker exec "$RABBIT_CONTAINER" rabbitmqctl set_permissions -p / "${RABBIT_USER}" ".*" ".*" ".*" >/dev/null 2>&1
+        echo "RabbitMQ credentials configured successfully."
+    fi
+fi
+'''
+
+# Insert RabbitMQ setup after services are started
+if 'docker compose up -d' in text:
+    # Find the line after 'docker compose up -d' and insert our RabbitMQ setup
+    lines = text.split('\n')
+    new_lines = []
+    for i, line in enumerate(lines):
+        new_lines.append(line)
+        # Insert after the docker compose up command
+        if 'docker compose up -d' in line and not line.strip().startswith('#'):
+            # Add our RabbitMQ configuration block
+            new_lines.append('')
+            new_lines.extend(rabbit_setup_check.split('\n'))
+            changes.append("RabbitMQ credential auto-configuration")
+    text = '\n'.join(new_lines)
+
 setup_path.write_text(text, encoding="utf-8")
 print("Applied hotfixes:")
 if changes:
