@@ -370,6 +370,61 @@ fi
 "safe stoat .env secret reuse",
 )
 
+if "compose_up_with_retries()" not in text:
+    marker = "# ─── Pre-flight ──────────────────────────────────────────────────────"
+    helper = """compose_up_with_retries() {
+    # Retry image pulls/starts because GHCR/network timeouts are common on fresh VPSes.
+    local attempt max_attempts delay
+    max_attempts=5
+    delay=5
+    export COMPOSE_PARALLEL_LIMIT="${COMPOSE_PARALLEL_LIMIT:-4}"
+
+    for attempt in $(seq 1 "$max_attempts"); do
+        if docker compose "$@" up -d; then
+            return 0
+        fi
+
+        if [ "$attempt" -lt "$max_attempts" ]; then
+            echo -e "  ${YELLOW}Docker start failed (attempt ${attempt}/${max_attempts}); retrying in ${delay}s...${NC}"
+            sleep "$delay"
+            delay=$((delay * 2))
+        fi
+    done
+    return 1
+}
+"""
+    if marker in text:
+        text = text.replace(marker, helper + "\n" + marker, 1)
+        changes.append("docker compose retry helper")
+
+replace_once(
+"""COMPOSE_EXIT=0
+docker compose "${PROFILES[@]}" up -d 2>&1 || COMPOSE_EXIT=$?
+if [ "$COMPOSE_EXIT" -ne 0 ]; then
+    fail "Docker failed to start. Run 'cd $INSTALL_DIR && docker compose logs' to see what went wrong."
+fi
+""",
+"""if ! compose_up_with_retries "${PROFILES[@]}"; then
+    fail "Docker failed to start after retries. Check internet/registry access, then run: cd $INSTALL_DIR && docker compose logs"
+fi
+""",
+"matrix compose up retry",
+)
+
+replace_once(
+"""COMPOSE_EXIT=0
+docker compose up -d 2>&1 || COMPOSE_EXIT=$?
+if [ "$COMPOSE_EXIT" -ne 0 ]; then
+    fail "Docker failed to start. Run 'cd $INSTALL_DIR && docker compose logs' to see what went wrong."
+fi
+""",
+"""if ! compose_up_with_retries; then
+    fail "Docker failed to start after retries. Check internet/registry access, then run: cd $INSTALL_DIR && docker compose logs"
+fi
+""",
+"stoat compose up retry",
+)
+
 replace_once(
 "    if docker compose exec -T synapse curl -sf http://localhost:8008/health >/dev/null 2>&1; then\n",
 "    if docker compose exec -T synapse python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8008/health', timeout=3).read()\" >/dev/null 2>&1; then\n",
