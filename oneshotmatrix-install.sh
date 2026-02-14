@@ -397,6 +397,40 @@ if "compose_up_with_retries()" not in text:
         text = text.replace(marker, helper + "\n" + marker, 1)
         changes.append("docker compose retry helper")
 
+if "ensure_rabbit_credentials()" not in text:
+    marker = "# ─── Pre-flight ──────────────────────────────────────────────────────"
+    helper = """ensure_rabbit_credentials() {
+    local user="$1"
+    local pass="$2"
+    local i
+
+    [ -n "${user:-}" ] || return 1
+    [ -n "${pass:-}" ] || return 1
+
+    for i in $(seq 1 45); do
+        if docker compose exec -T rabbit rabbitmqctl await_startup >/dev/null 2>&1; then
+            break
+        fi
+        sleep 2
+    done
+    docker compose exec -T rabbit rabbitmqctl await_startup >/dev/null 2>&1 || return 1
+
+    if docker compose exec -T rabbit rabbitmqctl authenticate_user "$user" "$pass" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    docker compose exec -T rabbit rabbitmqctl add_user "$user" "$pass" >/dev/null 2>&1 || true
+    docker compose exec -T rabbit rabbitmqctl change_password "$user" "$pass" >/dev/null 2>&1 || true
+    docker compose exec -T rabbit rabbitmqctl set_user_tags "$user" administrator >/dev/null 2>&1 || true
+    docker compose exec -T rabbit rabbitmqctl set_permissions -p / "$user" ".*" ".*" ".*" >/dev/null 2>&1 || true
+
+    docker compose exec -T rabbit rabbitmqctl authenticate_user "$user" "$pass" >/dev/null 2>&1
+}
+"""
+    if marker in text:
+        text = text.replace(marker, helper + "\n" + marker, 1)
+        changes.append("rabbit credential sync helper")
+
 replace_once(
 """COMPOSE_EXIT=0
 docker compose "${PROFILES[@]}" up -d 2>&1 || COMPOSE_EXIT=$?
@@ -426,6 +460,28 @@ fi
 )
 
 replace_once(
+"""if ! compose_up_with_retries; then
+    fail "Docker failed to start after retries. Check internet/registry access, then run: cd $INSTALL_DIR && docker compose logs"
+fi
+
+ok
+""",
+"""if ! compose_up_with_retries; then
+    fail "Docker failed to start after retries. Check internet/registry access, then run: cd $INSTALL_DIR && docker compose logs"
+fi
+
+if ! ensure_rabbit_credentials "$RABBIT_USER" "$RABBIT_PASSWORD"; then
+    fail "RabbitMQ credentials could not be verified/applied."
+fi
+
+docker compose restart api pushd events >/dev/null 2>&1 || true
+
+ok
+""",
+"stoat rabbit credential sync after compose up",
+)
+
+replace_once(
 "    if docker compose exec -T synapse curl -sf http://localhost:8008/health >/dev/null 2>&1; then\n",
 "    if docker compose exec -T synapse python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8008/health', timeout=3).read()\" >/dev/null 2>&1; then\n",
 "matrix readiness probe without curl dependency",
@@ -433,7 +489,13 @@ replace_once(
 
 replace_once(
 "    if docker compose exec -T api curl -sf http://localhost:14702/ >/dev/null 2>&1; then\n",
-"    if docker inspect -f '{{.State.Status}}' \"$(docker compose ps -q api)\" 2>/dev/null | grep -qx running; then\n",
+"    api_cid=\"$(docker compose ps -q api 2>/dev/null || true)\"\n"
+"    status=\"$(docker inspect -f '{{.State.Status}}' \"$api_cid\" 2>/dev/null || true)\"\n"
+"    restarts_before=\"$(docker inspect -f '{{.RestartCount}}' \"$api_cid\" 2>/dev/null || echo 0)\"\n"
+"    sleep 2\n"
+"    status_after=\"$(docker inspect -f '{{.State.Status}}' \"$api_cid\" 2>/dev/null || true)\"\n"
+"    restarts_after=\"$(docker inspect -f '{{.RestartCount}}' \"$api_cid\" 2>/dev/null || echo 0)\"\n"
+"    if [ -n \"$api_cid\" ] && [ \"$status\" = \"running\" ] && [ \"$status_after\" = \"running\" ] && [ \"$restarts_after\" = \"$restarts_before\" ]; then\n",
 "stoat readiness probe without container curl dependency",
 )
 
@@ -455,11 +517,17 @@ apply_pangolin_offload_patches() {
 
   local setup_file="$INSTALL_DIR/setup.sh"
   local compose_file="$INSTALL_DIR/docker-compose.yml"
+  local stoat_compose_file="$INSTALL_DIR/docker-compose.stoat.yml"
   local matrix_template="$INSTALL_DIR/templates/matrix.conf.template"
+  local stoat_env_template="$INSTALL_DIR/templates/stoat-env.web.template"
+  local caddy_template="$INSTALL_DIR/templates/Caddyfile.template"
 
   [[ -f "$setup_file" ]] || die "setup.sh not found at ${setup_file}"
   [[ -f "$compose_file" ]] || die "docker-compose.yml not found at ${compose_file}"
+  [[ -f "$stoat_compose_file" ]] || die "docker-compose.stoat.yml not found at ${stoat_compose_file}"
   [[ -f "$matrix_template" ]] || die "matrix.conf template not found at ${matrix_template}"
+  [[ -f "$stoat_env_template" ]] || die "stoat env template not found at ${stoat_env_template}"
+  [[ -f "$caddy_template" ]] || die "Caddyfile template not found at ${caddy_template}"
 
   # 1) Patch setup flow: skip certbot, generate local self-signed cert, and avoid local 443/8448 firewall rules.
   python3 - "$setup_file" <<'PY'
@@ -571,6 +639,26 @@ if firewall_block_old in text:
     text = text.replace(firewall_block_old, firewall_block_new, 1)
     changes.append("firewall step adapted for offload mode")
 
+stoat_firewall_old = '''SSH_PORT=$(detect_ssh_port)
+fw_allow "${SSH_PORT}/tcp"
+fw_allow 80/tcp
+fw_allow 443/tcp
+fw_enable'''
+
+stoat_firewall_new = '''SSH_PORT=$(detect_ssh_port)
+fw_allow "${SSH_PORT}/tcp"
+fw_allow 80/tcp
+if [ "${PANGOLIN_SSL_OFFLOAD:-false}" = "true" ]; then
+    echo -e "  ${YELLOW}Pangolin SSL offload mode: skipping local 443 firewall rule.${NC}"
+else
+    fw_allow 443/tcp
+fi
+fw_enable'''
+
+if stoat_firewall_old in text:
+    text = text.replace(stoat_firewall_old, stoat_firewall_new, 1)
+    changes.append("stoat firewall adapted for offload mode")
+
 cron_block_old = '''# Certbot cron for renewal (webroot mode using nginx)
 # Add cert renewal cron if not already present
 CRON_LINE="0 3 * * * certbot renew --deploy-hook 'cd $INSTALL_DIR && docker compose exec -T nginx nginx -s reload && docker compose restart coturn' # matrix-discord-killer"
@@ -659,7 +747,7 @@ server {
 }
 EOF
 
-  # 3) Expose only backend HTTP when SSL is terminated by Pangolin.
+  # 3) Expose only backend HTTP for Matrix when SSL is terminated by Pangolin.
   python3 - "$compose_file" <<'PY'
 import sys
 from pathlib import Path
@@ -677,7 +765,80 @@ new = '''    ports:
 if old in text:
     text = text.replace(old, new, 1)
 path.write_text(text, encoding="utf-8")
-print("Pangolin docker-compose patch applied.")
+print("Pangolin matrix docker-compose patch applied.")
+PY
+
+  # 4) Configure Stoat/Caddy for HTTP-only backend when Pangolin handles TLS.
+  cat >"$stoat_env_template" <<'EOF'
+HOSTNAME=__DOMAIN__
+REVOLT_PUBLIC_URL=https://__DOMAIN__/api
+EOF
+
+  cat >"$caddy_template" <<'EOF'
+http://{$HOSTNAME} {
+	header {
+		Strict-Transport-Security "max-age=15552000; includeSubDomains"
+		X-Frame-Options SAMEORIGIN
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+
+	route /api* {
+		uri strip_prefix /api
+		reverse_proxy http://api:14702 {
+			header_down Location "^/" "/api/"
+		}
+	}
+
+	route /ws {
+		uri strip_prefix /ws
+		reverse_proxy http://events:14703 {
+			header_down Location "^/" "/ws/"
+		}
+	}
+
+	route /autumn* {
+		uri strip_prefix /autumn
+		reverse_proxy http://autumn:14704 {
+			header_down Location "^/" "/autumn/"
+		}
+	}
+
+	route /january* {
+		uri strip_prefix /january
+		reverse_proxy http://january:14705 {
+			header_down Location "^/" "/january/"
+		}
+	}
+
+	route /gifbox* {
+		uri strip_prefix /gifbox
+		reverse_proxy http://gifbox:14706 {
+			header_down Location "^/" "/gifbox/"
+		}
+	}
+
+	reverse_proxy http://web:5000
+}
+EOF
+
+  python3 - "$stoat_compose_file" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old = '''    ports:
+      - "80:80"
+      - "443:443"
+'''
+new = '''    ports:
+      - "80:80"
+'''
+if old in text:
+    text = text.replace(old, new, 1)
+path.write_text(text, encoding="utf-8")
+print("Pangolin stoat docker-compose patch applied.")
 PY
 
   bash -n "$setup_file" || die "Pangolin-patched setup.sh failed syntax validation."
