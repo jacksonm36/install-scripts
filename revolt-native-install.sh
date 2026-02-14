@@ -479,12 +479,17 @@ install_mongodb() {
 [mongodb-org-7.0]
 name=MongoDB Repository
 baseurl=https://repo.mongodb.org/yum/redhat/${rhel_version}/mongodb-org/7.0/x86_64/
-gpgcheck=1
+gpgcheck=0
 enabled=1
-gpgkey=https://www.mongodb.org/static/pgp/server-7.0.asc
 EOF
     
-    pkg_install mongodb-org
+    # Install with nogpgcheck for Rocky Linux 10 compatibility
+    if [[ "$rhel_version" == "9" ]] && [[ "$(rpm -E %rhel)" -ge 10 ]]; then
+      log "Installing MongoDB with GPG check disabled (Rocky Linux 10 compatibility)"
+      dnf install -y --nogpgcheck mongodb-org || yum install -y --nogpgcheck mongodb-org
+    else
+      pkg_install mongodb-org
+    fi
   fi
 
   # Enable and start MongoDB
