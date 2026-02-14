@@ -755,6 +755,9 @@ services:
     depends_on:
       minio:
         condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: \${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: \${MINIO_ROOT_PASSWORD}
     networks:
       - revolt-network
     entrypoint: >
@@ -765,7 +768,7 @@ services:
       max_attempts=30;
       attempt=0;
       while [ \$\$attempt -lt \$\$max_attempts ]; do
-        if /usr/bin/mc alias set myminio http://minio:9000 \${MINIO_ROOT_USER} \${MINIO_ROOT_PASSWORD} 2>/dev/null; then
+        if /usr/bin/mc alias set myminio http://minio:9000 \$\$MINIO_ROOT_USER \$\$MINIO_ROOT_PASSWORD 2>/dev/null; then
           echo 'MinIO connection established';
           break;
         fi;
@@ -885,7 +888,7 @@ EOF
     networks:
       - revolt-network
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -x pushd >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "ps aux | grep -v grep | grep -q 'revolt.*pushd\\|node.*pushd' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
