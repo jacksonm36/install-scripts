@@ -67,6 +67,10 @@ ensure_line_in_hosts() {
   local short_name="$3"
   local hosts_line="${ip} ${fqdn} ${short_name}"
 
+  if grep -qxF "$hosts_line" /etc/hosts; then
+    return 0
+  fi
+
   if ! getent hosts "$fqdn" >/dev/null 2>&1; then
     warn "Hostname '${fqdn}' is not resolvable. Adding a local /etc/hosts entry."
     printf '%s\n' "$hosts_line" >> /etc/hosts
@@ -105,21 +109,19 @@ CHEF_ADMIN_USER="${CHEF_ADMIN_USER:-chefadmin}"
 CHEF_ADMIN_FIRST_NAME="${CHEF_ADMIN_FIRST_NAME:-Chef}"
 CHEF_ADMIN_LAST_NAME="${CHEF_ADMIN_LAST_NAME:-Admin}"
 CHEF_ADMIN_EMAIL="${CHEF_ADMIN_EMAIL:-chefadmin@${HOST_FQDN}}"
-if [[ -n "${CHEF_ADMIN_PASSWORD:-}" ]]; then
-  CHEF_ADMIN_PASSWORD_SOURCE="provided"
-else
-  CHEF_ADMIN_PASSWORD="$(generate_secret)"
-  CHEF_ADMIN_PASSWORD_SOURCE="generated"
-fi
+CHEF_ADMIN_PASSWORD="${CHEF_ADMIN_PASSWORD:-}"
+CHEF_ADMIN_PASSWORD_SOURCE=""
 CHEF_ORG_SHORT="${CHEF_ORG_SHORT:-infra}"
 CHEF_ORG_FULL="${CHEF_ORG_FULL:-Infrastructure Organization}"
 INSTALL_CHEF_WORKSTATION="${INSTALL_CHEF_WORKSTATION:-true}"
 
 PUPPET_CERTNAME="${PUPPET_CERTNAME:-${HOST_FQDN}}"
+PUPPET_SERVER_HOST="${PUPPET_SERVER_HOST:-${HOST_FQDN}}"
 PUPPET_DNS_ALT_NAMES="${PUPPET_DNS_ALT_NAMES:-${HOST_FQDN},puppet}"
 PUPPETSERVER_JAVA_ARGS="${PUPPETSERVER_JAVA_ARGS:--Xms1g -Xmx1g}"
 PUPPETBOARD_BIND="${PUPPETBOARD_BIND:-0.0.0.0}"
 PUPPETBOARD_PORT="${PUPPETBOARD_PORT:-3000}"
+PUPPETBOARD_SSL_VERIFY="${PUPPETBOARD_SSL_VERIFY:-false}"
 CONFIGURE_UFW="${CONFIGURE_UFW:-true}"
 
 CHEF_ADMIN_PEM="${CHEF_KEY_DIR}/${CHEF_ADMIN_USER}.pem"
@@ -153,7 +155,7 @@ install_chef_server() {
   else
     log "Installing Chef Infra Server..."
     package_url="$(fetch_chef_package_url "chef-server")"
-    package_path="/tmp/chef-server-core_${UBUNTU_VERSION}_amd64.deb"
+    package_path="$(mktemp /tmp/chef-server-XXXXXX.deb)"
     download_file "$package_url" "$package_path"
     DEBIAN_FRONTEND=noninteractive apt-get install -y "$package_path"
     rm -f "$package_path"
@@ -206,7 +208,7 @@ install_chef_workstation() {
 
   log "Installing Chef Workstation..."
   package_url="$(fetch_chef_package_url "chef-workstation")"
-  package_path="/tmp/chef-workstation_${UBUNTU_VERSION}_amd64.deb"
+  package_path="$(mktemp /tmp/chef-workstation-XXXXXX.deb)"
   download_file "$package_url" "$package_path"
   DEBIAN_FRONTEND=noninteractive apt-get install -y "$package_path"
   rm -f "$package_path"
@@ -279,7 +281,7 @@ configure_puppet_files() {
   cat > /etc/puppetlabs/puppet/puppet.conf <<EOF
 [main]
 certname = ${PUPPET_CERTNAME}
-server = ${PUPPET_CERTNAME}
+server = ${PUPPET_SERVER_HOST}
 environment = production
 runinterval = 1h
 
@@ -292,7 +294,7 @@ EOF
 
   cat > /etc/puppetlabs/puppet/puppetdb.conf <<EOF
 [main]
-server_urls = https://${PUPPET_CERTNAME}:8081
+server_urls = https://${PUPPET_SERVER_HOST}:8081
 soft_write_failure = false
 EOF
 
@@ -365,11 +367,18 @@ install_puppetboard() {
   "${PUPPETBOARD_VENV}/bin/pip" install --upgrade pip setuptools wheel
   "${PUPPETBOARD_VENV}/bin/pip" install --upgrade gunicorn puppetboard
 
+  local ssl_verify_py
+  if is_true "$PUPPETBOARD_SSL_VERIFY"; then
+    ssl_verify_py="True"
+  else
+    ssl_verify_py="False"
+  fi
+
   cat > "$PUPPETBOARD_SETTINGS" <<EOF
 PUPPETDB_HOST = '127.0.0.1'
 PUPPETDB_PORT = 8081
 PUPPETDB_PROTO = 'https'
-PUPPETDB_SSL_VERIFY = False
+PUPPETDB_SSL_VERIFY = ${ssl_verify_py}
 LOCALISE_TIMESTAMP = True
 EOF
 
@@ -467,11 +476,13 @@ Organization URL: ${CHEF_ORG_URL}
 Puppet Master + UI
 ------------------
 Puppet certname: ${PUPPET_CERTNAME}
+Puppet server host: ${PUPPET_SERVER_HOST}
 Puppet DNS alt names: ${PUPPET_DNS_ALT_NAMES}
 Puppet Server endpoint: https://${HOST_FQDN}:8140/
-PuppetDB endpoint: https://${HOST_FQDN}:8081/
+PuppetDB endpoint: https://${PUPPET_SERVER_HOST}:8081/
 Puppetboard bind: ${PUPPETBOARD_BIND}
 Puppetboard URL: ${PUPPETBOARD_URL}
+Puppetboard SSL verify: ${PUPPETBOARD_SSL_VERIFY}
 
 Notes
 -----
@@ -494,6 +505,12 @@ main() {
   log "Starting installer v${SCRIPT_VERSION} on ${PRETTY_NAME:-Ubuntu} (${HOST_FQDN})"
   ensure_line_in_hosts "127.0.1.1" "$HOST_FQDN" "$HOST_SHORT"
   install_base_packages
+  if [[ -n "$CHEF_ADMIN_PASSWORD" ]]; then
+    CHEF_ADMIN_PASSWORD_SOURCE="provided"
+  else
+    CHEF_ADMIN_PASSWORD="$(generate_secret)"
+    CHEF_ADMIN_PASSWORD_SOURCE="generated"
+  fi
   install_chef_server
   install_chef_workstation
   configure_knife
